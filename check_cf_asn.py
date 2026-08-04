@@ -20,8 +20,8 @@ PORTS = [443, 2053, 2083, 2087, 2096, 8443]
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
-STAGE1_CONCURRENCY = 2000
-STAGE1_TIMEOUT = 0.5
+STAGE1_CONCURRENCY = 1000
+STAGE1_TIMEOUT = 1
 CF_HOST_TEST = "crypto.cloudflare.com"
 
 try:
@@ -118,14 +118,6 @@ def check_tls_sni(ip, port, sni, timeout_val):
         return False
 
 
-def check_tls_multiport(ip, sni, timeout_val):
-    """粗筛：任一端口 TLS 通过即算过，全部不过才丢弃。"""
-    for port in PORTS:
-        if check_tls_sni(ip, port, sni, timeout_val):
-            return True
-    return False
-
-
 def check_http_via_curl(ip, port, host, timeout_val):
     cmd = [
         "curl", "-I", "-s",
@@ -156,7 +148,7 @@ async def run_stage1_worker_queue(ip_list):
     for ip in ip_list:
         queue.put_nowait(ip)
 
-    print(f"\n[1/3 第一阶段 TLS 探测(多端口)] 开始测试，共 {total} 个目标...", flush=True)
+    print(f"\n[1/3 第一阶段 TLS 探测(443粗筛)] 开始测试，共 {total} 个目标...", flush=True)
     loop = asyncio.get_running_loop()
 
     async def worker():
@@ -168,7 +160,7 @@ async def run_stage1_worker_queue(ip_list):
                 break
 
             ok = await loop.run_in_executor(
-                custom_executor, check_tls_multiport, ip, CF_SNI_1, STAGE1_TIMEOUT
+                custom_executor, check_tls_sni, ip, 443, CF_SNI_1, STAGE1_TIMEOUT
             )
             completed += 1
             if ok:
