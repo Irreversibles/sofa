@@ -6,7 +6,6 @@ import resource
 import urllib.request
 import json
 import ipaddress
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import geoip2.database
@@ -16,7 +15,6 @@ DEFAULT_ASN = os.getenv("ASN_LIST", "AS13335")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "RESULT")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 
-# 待测端口（去除 2087）
 TARGET_PORTS = [443, 2053, 2083, 2096, 8443]
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
@@ -24,7 +22,6 @@ GEOIP_DB = "GeoLite2-Country.mmdb"
 CF_SNI_1 = "www.cloudflare.com"
 STAGE1_CONCURRENCY = 2000
 STAGE1_TIMEOUT = 0.5
-CF_HOST_TEST = "crypto.cloudflare.com"
 
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -120,35 +117,7 @@ def check_tls_sni(ip, port, sni, timeout_val):
         return False
 
 
-def check_http_via_curl(ip, port, host, timeout_val):
-    cmd = [
-        "curl", "-I", "-s",
-        "-o", "/dev/null",
-        "-w", "%{http_code}",
-        "--connect-timeout", "2",
-        "-m", str(int(timeout_val)),
-        "--resolve", f"{host}:{port}:{ip}",
-        f"https://{host}:{port}/",
-    ]
-    try:
-        res = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        return res.stdout.strip() in ("301", "302")
-    except Exception:
-        return False
-
-
-async def stage2_task(item):
-    ip, port = item
-    loop = asyncio.get_running_loop()
-    ok = await loop.run_in_executor(
-        custom_executor, check_http_via_curl, ip, port, CF_HOST_TEST, 3.0
-    )
-    return item if ok else None
-
-
-async def stage3_task(item, custom_domain):
+async def stage_domain_task(item, custom_domain):
     ip, port = item
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(
@@ -168,7 +137,7 @@ async def run_stage1_worker_queue(targets):
     for item in targets:
         queue.put_nowait(item)
 
-    print(f"\n[1/3 第一阶段 TLS 探测] 开始测试，共 {total} 个目标 (IP:端口组合)...", flush=True)
+    print(f"\n[1/2 第一阶段 TLS 探测] 开始测试，共 {total} 个目标 (IP:端口组合)...", flush=True)
     loop = asyncio.get_running_loop()
 
     async def worker():
@@ -191,7 +160,7 @@ async def run_stage1_worker_queue(targets):
                 last_printed_step = current_step
                 percent = (completed / total) * 100
                 print(
-                    f"[1/3 进度] {completed}/{total} ({percent:.1f}%) | "
+                    f"[1/2 进度] {completed}/{total} ({percent:.1f}%) | "
                     f"当前通过: {len(passed_items)} 个",
                     flush=True,
                 )
@@ -229,27 +198,17 @@ async def main():
         print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
-    print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1)} 个候选...", flush=True)
-    tasks2 = [stage2_task(item) for item in pass_1]
-    res2 = await asyncio.gather(*tasks2)
-    pass_2 = [item for item in res2 if item is not None]
-    print(f"[+] 第二阶段完成！返回 301 的目标: {len(pass_2)} 个\n", flush=True)
-    if not pass_2:
-        print("[-] 无有效目标通过第二阶段。", flush=True)
-        return
-
-    final_items = pass_2
+    final_items = pass_1
     if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
         domain = CUSTOM_CF_DOMAIN.strip()
-        print(f"[3/3 第三阶段自定义域名校验] 校验 {domain}...", flush=True)
-        tasks3 = [stage3_task(item, domain) for item in pass_2]
-        res3 = await asyncio.gather(*tasks3)
-        final_items = [item for item in res3 if item is not None]
-        print(f"[+] 第三阶段完成！有效目标: {len(final_items)} 个", flush=True)
+        print(f"[2/2 第二阶段自定义域名校验] 校验 {domain}，共 {len(pass_1)} 个...", flush=True)
+        tasks = [stage_domain_task(item, domain) for item in pass_1]
+        res = await asyncio.gather(*tasks)
+        final_items = [item for item in res if item is not None]
+        print(f"[+] 第二阶段完成！有效目标: {len(final_items)} 个", flush=True)
     else:
-        print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，跳过第三阶段。", flush=True)
+        print("[2/2] 未检测到 CUSTOM_CF_DOMAIN，跳过域名校验。", flush=True)
 
-    # 结果：加地区，按 (地区, ip, 端口) 排序
     results = []
     for ip, port in final_items:
         country = get_country(ip)
