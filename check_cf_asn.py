@@ -20,8 +20,8 @@ PORTS = [443, 2053, 2083, 2087, 2096, 8443]
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
-STAGE1_CONCURRENCY = 1000
-STAGE1_TIMEOUT = 1
+STAGE1_CONCURRENCY = 1500
+STAGE1_TIMEOUT = 0.5
 CF_HOST_TEST = "crypto.cloudflare.com"
 
 try:
@@ -118,6 +118,14 @@ def check_tls_sni(ip, port, sni, timeout_val):
         return False
 
 
+def find_alive_port(ip, sni, timeout_val):
+    """粗筛：逐端口试 TLS，返回第一个通过的端口；全不过返回 None。"""
+    for port in PORTS:
+        if check_tls_sni(ip, port, sni, timeout_val):
+            return port
+    return None
+
+
 def check_http_via_curl(ip, port, host, timeout_val):
     cmd = [
         "curl", "-I", "-s",
@@ -138,9 +146,10 @@ def check_http_via_curl(ip, port, host, timeout_val):
 
 
 async def run_stage1_worker_queue(ip_list):
+    """粗筛：多端口，任一 TLS 过即保留，记录 (ip, 通过的端口)。"""
     total = len(ip_list)
     completed = 0
-    passed_ips = []
+    passed = []
     step = max(1, total // 10)
     last_printed_step = 0
 
@@ -148,7 +157,7 @@ async def run_stage1_worker_queue(ip_list):
     for ip in ip_list:
         queue.put_nowait(ip)
 
-    print(f"\n[1/3 第一阶段 TLS 探测(443粗筛)] 开始测试，共 {total} 个目标...", flush=True)
+    print(f"\n[1/3 第一阶段 TLS 探测(多端口)] 开始测试，共 {total} 个目标...", flush=True)
     loop = asyncio.get_running_loop()
 
     async def worker():
@@ -159,12 +168,12 @@ async def run_stage1_worker_queue(ip_list):
             except asyncio.QueueEmpty:
                 break
 
-            ok = await loop.run_in_executor(
-                custom_executor, check_tls_sni, ip, 443, CF_SNI_1, STAGE1_TIMEOUT
+            port = await loop.run_in_executor(
+                custom_executor, find_alive_port, ip, CF_SNI_1, STAGE1_TIMEOUT
             )
             completed += 1
-            if ok:
-                passed_ips.append(ip)
+            if port is not None:
+                passed.append((ip, port))
 
             current_step = completed // step
             if current_step > last_printed_step or completed == total:
@@ -172,19 +181,22 @@ async def run_stage1_worker_queue(ip_list):
                 percent = (completed / total) * 100
                 print(
                     f"[1/3 进度] {completed}/{total} ({percent:.1f}%) | "
-                    f"当前通过: {len(passed_ips)} 个",
+                    f"当前通过: {len(passed)} 个",
                     flush=True,
                 )
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(STAGE1_CONCURRENCY)]
     await asyncio.gather(*workers)
-    return passed_ips
+    return passed
 
 
-async def full_check(ip):
+async def full_check(ip, first_port):
+    """从粗筛通过的端口开始，逐端口做 HTTP301 + 域名验证，命中即返回。"""
     loop = asyncio.get_running_loop()
-    for port in PORTS:
+    # 把粗筛通过的端口放最前，其余端口补后面
+    ordered_ports = [first_port] + [p for p in PORTS if p != first_port]
+    for port in ordered_ports:
         ok_http = await loop.run_in_executor(
             custom_executor, check_http_via_curl, ip, port, CF_HOST_TEST, 3.0
         )
@@ -221,8 +233,8 @@ async def main():
         print("[-] 无有效 IP 通过第一阶段。", flush=True)
         return
 
-    print(f"[2/3 第二三阶段] 对 {len(pass_1)} 个候选做多端口+HTTP+域名验证...", flush=True)
-    tasks = [full_check(ip) for ip in pass_1]
+    print(f"[2/3 第二三阶段] 对 {len(pass_1)} 个候选做 HTTP+域名验证...", flush=True)
+    tasks = [full_check(ip, port) for ip, port in pass_1]
     results = await asyncio.gather(*tasks)
     final = [r for r in results if r is not None]
     print(f"[+] 最终有效节点: {len(final)} 个", flush=True)
