@@ -16,12 +16,14 @@ DEFAULT_ASN = os.getenv("ASN_LIST", "AS13335")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "RESULT")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 
-PORTS = [443, 2053, 2083, 2087, 2096, 8443]
+# 待测端口（去除 2087）
+TARGET_PORTS = [443, 2053, 2083, 2096, 8443]
+
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
-STAGE1_CONCURRENCY = 800
-STAGE1_TIMEOUT = 1.5
+STAGE1_CONCURRENCY = 2000
+STAGE1_TIMEOUT = 0.5
 CF_HOST_TEST = "crypto.cloudflare.com"
 
 try:
@@ -118,20 +120,12 @@ def check_tls_sni(ip, port, sni, timeout_val):
         return False
 
 
-def find_alive_port(ip, sni, timeout_val):
-    """粗筛：逐端口试 TLS，返回第一个通过的端口；全不过返回 None。"""
-    for port in PORTS:
-        if check_tls_sni(ip, port, sni, timeout_val):
-            return port
-    return None
-
-
 def check_http_via_curl(ip, port, host, timeout_val):
     cmd = [
         "curl", "-I", "-s",
         "-o", "/dev/null",
         "-w", "%{http_code}",
-        "--connect-timeout", "3",
+        "--connect-timeout", "2",
         "-m", str(int(timeout_val)),
         "--resolve", f"{host}:{port}:{ip}",
         f"https://{host}:{port}/",
@@ -145,35 +139,52 @@ def check_http_via_curl(ip, port, host, timeout_val):
         return False
 
 
-async def run_stage1_worker_queue(ip_list):
-    """粗筛：多端口，任一 TLS 过即保留，记录 (ip, 通过的端口)。"""
-    total = len(ip_list)
+async def stage2_task(item):
+    ip, port = item
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(
+        custom_executor, check_http_via_curl, ip, port, CF_HOST_TEST, 3.0
+    )
+    return item if ok else None
+
+
+async def stage3_task(item, custom_domain):
+    ip, port = item
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(
+        custom_executor, check_tls_sni, ip, port, custom_domain, 3.0
+    )
+    return item if ok else None
+
+
+async def run_stage1_worker_queue(targets):
+    total = len(targets)
     completed = 0
-    passed = []
+    passed_items = []
     step = max(1, total // 10)
     last_printed_step = 0
 
     queue = asyncio.Queue()
-    for ip in ip_list:
-        queue.put_nowait(ip)
+    for item in targets:
+        queue.put_nowait(item)
 
-    print(f"\n[1/3 第一阶段 TLS 探测(多端口)] 开始测试，共 {total} 个目标...", flush=True)
+    print(f"\n[1/3 第一阶段 TLS 探测] 开始测试，共 {total} 个目标 (IP:端口组合)...", flush=True)
     loop = asyncio.get_running_loop()
 
     async def worker():
         nonlocal completed, last_printed_step
         while True:
             try:
-                ip = queue.get_nowait()
+                ip, port = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
 
-            port = await loop.run_in_executor(
-                custom_executor, find_alive_port, ip, CF_SNI_1, STAGE1_TIMEOUT
+            ok = await loop.run_in_executor(
+                custom_executor, check_tls_sni, ip, port, CF_SNI_1, STAGE1_TIMEOUT
             )
             completed += 1
-            if port is not None:
-                passed.append((ip, port))
+            if ok:
+                passed_items.append((ip, port))
 
             current_step = completed // step
             if current_step > last_printed_step or completed == total:
@@ -181,35 +192,14 @@ async def run_stage1_worker_queue(ip_list):
                 percent = (completed / total) * 100
                 print(
                     f"[1/3 进度] {completed}/{total} ({percent:.1f}%) | "
-                    f"当前通过: {len(passed)} 个",
+                    f"当前通过: {len(passed_items)} 个",
                     flush=True,
                 )
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(STAGE1_CONCURRENCY)]
     await asyncio.gather(*workers)
-    return passed
-
-
-async def full_check(ip, first_port):
-    """从粗筛通过的端口开始，逐端口做 HTTP301 + 域名验证，命中即返回。"""
-    loop = asyncio.get_running_loop()
-    ordered_ports = [first_port] + [p for p in PORTS if p != first_port]
-    for port in ordered_ports:
-        ok_http = await loop.run_in_executor(
-            custom_executor, check_http_via_curl, ip, port, CF_HOST_TEST, 4.0
-        )
-        if not ok_http:
-            continue
-        if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
-            ok_domain = await loop.run_in_executor(
-                custom_executor, check_tls_sni, ip, port, CUSTOM_CF_DOMAIN.strip(), 3.0
-            )
-            if not ok_domain:
-                continue
-        country = get_country(ip)
-        return (country, f"{ip}:{port}")
-    return None
+    return passed_items
 
 
 async def main():
@@ -226,24 +216,54 @@ async def main():
         print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
         return
 
-    pass_1 = await run_stage1_worker_queue(all_ips)
-    print(f"[+] 第一阶段完成！保留 IP: {len(pass_1)} 个\n", flush=True)
+    targets = [(ip, port) for ip in all_ips for port in TARGET_PORTS]
+    print(
+        f"[*] {len(all_ips)} 个 IP × {len(TARGET_PORTS)} 个端口 = "
+        f"共 {len(targets)} 个连接目标。",
+        flush=True,
+    )
+
+    pass_1 = await run_stage1_worker_queue(targets)
+    print(f"[+] 第一阶段完成！保留目标: {len(pass_1)} 个\n", flush=True)
     if not pass_1:
-        print("[-] 无有效 IP 通过第一阶段。", flush=True)
+        print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
-    print(f"[2/3 第二三阶段] 对 {len(pass_1)} 个候选做 HTTP+域名验证...", flush=True)
-    tasks = [full_check(ip, port) for ip, port in pass_1]
-    results = await asyncio.gather(*tasks)
-    final = [r for r in results if r is not None]
-    print(f"[+] 最终有效节点: {len(final)} 个", flush=True)
+    print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1)} 个候选...", flush=True)
+    tasks2 = [stage2_task(item) for item in pass_1]
+    res2 = await asyncio.gather(*tasks2)
+    pass_2 = [item for item in res2 if item is not None]
+    print(f"[+] 第二阶段完成！返回 301 的目标: {len(pass_2)} 个\n", flush=True)
+    if not pass_2:
+        print("[-] 无有效目标通过第二阶段。", flush=True)
+        return
 
-    final = sorted(set(final), key=lambda x: (x[0], x[1]))
+    final_items = pass_2
+    if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
+        domain = CUSTOM_CF_DOMAIN.strip()
+        print(f"[3/3 第三阶段自定义域名校验] 校验 {domain}...", flush=True)
+        tasks3 = [stage3_task(item, domain) for item in pass_2]
+        res3 = await asyncio.gather(*tasks3)
+        final_items = [item for item in res3 if item is not None]
+        print(f"[+] 第三阶段完成！有效目标: {len(final_items)} 个", flush=True)
+    else:
+        print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，跳过第三阶段。", flush=True)
+
+    # 结果：加地区，按 (地区, ip, 端口) 排序
+    results = []
+    for ip, port in final_items:
+        country = get_country(ip)
+        results.append((country, ip, port))
+    results = sorted(set(results), key=lambda x: (x[0], ipaddress.ip_address(x[1]), x[2]))
+
+    print("\n==================== 扫描结束 ====================", flush=True)
+    print(f"目标 ASN: {asn_clean} | 端口: {TARGET_PORTS}", flush=True)
+    print(f"最终有效目标总数: {len(results)}", flush=True)
 
     output_filename = f"{name_label}.txt"
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
-        for country, addr in final:
-            f.write(f"{addr}#{country} {name_label}\n")
+        for country, ip, port in results:
+            f.write(f"{ip}:{port}#{country} {name_label}\n")
 
     print(f"\n[+] 结果已保存至：{output_filename}", flush=True)
 
