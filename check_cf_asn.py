@@ -6,6 +6,7 @@ import resource
 import urllib.request
 import json
 import ipaddress
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import geoip2.database
@@ -15,7 +16,12 @@ DEFAULT_ASN = os.getenv("ASN_LIST", "AS13335")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "RESULT")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 
+# 待测端口（去除 2087）
 TARGET_PORTS = [443, 2053, 2083, 2096, 8443]
+
+# EDT 后台特征关键词（访问 /admin 返回的页面里应包含此词）
+EDT_KEYWORD = "edgetunnel"
+EDT_PATH = "/admin"
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
@@ -117,11 +123,29 @@ def check_tls_sni(ip, port, sni, timeout_val):
         return False
 
 
-async def stage_domain_task(item, custom_domain):
+def check_edt_backend(ip, port, domain, timeout_val):
+    """访问 域名/admin，检查响应是否包含 EDT 后台特征（edgetunnel）。"""
+    cmd = [
+        "curl", "-s", "-L",
+        "--connect-timeout", "4",
+        "-m", str(int(timeout_val)),
+        "--resolve", f"{domain}:{port}:{ip}",
+        f"https://{domain}:{port}{EDT_PATH}",
+    ]
+    try:
+        res = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        return EDT_KEYWORD.lower() in res.stdout.lower()
+    except Exception:
+        return False
+
+
+async def stage2_task(item, domain):
     ip, port = item
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(
-        custom_executor, check_tls_sni, ip, port, custom_domain, 3.0
+        custom_executor, check_edt_backend, ip, port, domain, 8.0
     )
     return item if ok else None
 
@@ -198,16 +222,12 @@ async def main():
         print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
-    final_items = pass_1
-    if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
-        domain = CUSTOM_CF_DOMAIN.strip()
-        print(f"[2/2 第二阶段自定义域名校验] 校验 {domain}，共 {len(pass_1)} 个...", flush=True)
-        tasks = [stage_domain_task(item, domain) for item in pass_1]
-        res = await asyncio.gather(*tasks)
-        final_items = [item for item in res if item is not None]
-        print(f"[+] 第二阶段完成！有效目标: {len(final_items)} 个", flush=True)
-    else:
-        print("[2/2] 未检测到 CUSTOM_CF_DOMAIN，跳过域名校验。", flush=True)
+    domain = CUSTOM_CF_DOMAIN.strip()
+    print(f"[2/2 第二阶段 EDT后台校验] 访问 {domain}{EDT_PATH}，校验 {len(pass_1)} 个候选...", flush=True)
+    tasks2 = [stage2_task(item, domain) for item in pass_1]
+    res2 = await asyncio.gather(*tasks2)
+    final_items = [item for item in res2 if item is not None]
+    print(f"[+] 第二阶段完成！可访问 EDT 后台的有效目标: {len(final_items)} 个", flush=True)
 
     results = []
     for ip, port in final_items:
