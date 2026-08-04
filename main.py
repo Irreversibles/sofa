@@ -6,6 +6,8 @@ import os
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import geoip2.database
+
 
 # ========================= 扫描配置 =========================
 
@@ -24,13 +26,36 @@ HTTP_DOMAIN = "crypto.cloudflare.com"
 # 第三步使用自己托管在 Cloudflare 上的域名验证证书
 CUSTOM_DOMAIN = "zeroo.ccwu.cc"
 
-# 输入文件
+# 输入文件、GeoIP 数据库
 IP_FILE = "ip.txt"
+GEOIP_DB = "GeoLite2-Country.mmdb"
+
+
+# ========================= GeoIP =========================
+
+try:
+    geo_reader = geoip2.database.Reader(GEOIP_DB)
+except Exception:
+    geo_reader = None
+    print("[警告] 未找到 GeoIP 数据库，地区将显示为 ??", flush=True)
+
+
+def get_country(ip):
+    """返回 IP 的两位国家代码，如 HK / JP / US；查不到返回 ??。"""
+    if geo_reader is None:
+        return "??"
+    try:
+        return geo_reader.country(ip).country.iso_code or "??"
+    except Exception:
+        return "??"
+
+
+# ========================= 读取 IP =========================
 
 
 def load_ip_list(file_path: str):
     """读取 ip.txt。
-    第一行若为 # 注释，作为输出文件名（如 # DMIT -> DMIT.txt）。
+    第一行若为 # 注释，作为输出文件名和名字标签（如 # DMIT）。
     其余行为 IP 或 CIDR 网段，网段自动展开成单个 IP。
     返回 (ip_list, output_name)。
     """
@@ -61,6 +86,9 @@ def load_ip_list(file_path: str):
                 ip_list.append(item)
 
     return ip_list, output_name
+
+
+# ========================= TLS 连接 =========================
 
 
 def create_tls_connection(ip, server_name, port, timeout=TIMEOUT):
@@ -158,20 +186,24 @@ def check_custom_domain(ip, port):
         return False
 
 
+# ========================= 单个 IP 检测 =========================
+
+
 def probe_ip(ip):
-    """依次尝试各端口，第一个通过三步验证的端口即返回 'ip:port'，否则 None。"""
+    """依次尝试各端口，第一个通过三步验证的端口即返回 (国家, 'ip:port')，否则 None。"""
     for port in PORTS:
         if (
             check_tls(ip, port)
             and check_http_301(ip, port)
             and check_custom_domain(ip, port)
         ):
-            return f"{ip}:{port}"
+            country = get_country(ip)
+            return (country, f"{ip}:{port}")
     return None
 
 
 def scan(ip_list):
-    """并发扫描所有 IP，返回通过验证的 'ip:port' 列表。"""
+    """并发扫描所有 IP，返回 [(国家, 'ip:port'), ...]。"""
     results = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -182,19 +214,27 @@ def scan(ip_list):
                 result = future.result()
                 if result:
                     results.append(result)
-                    print(f"[OK] 有效节点: {result}", flush=True)
+                    country, addr = result
+                    print(f"[OK] 有效节点: {addr}#{country}", flush=True)
             except Exception:
                 pass
 
     return results
 
 
-def save_best_ips(results, file_path):
-    """保存 ip:port，每行一个，覆盖旧结果。"""
-    unique = sorted(set(results))
+# ========================= 保存结果 =========================
+
+
+def save_best_ips(results, output_name, file_path):
+    """按地区分组排序保存，格式：ip:port#地区 名字。"""
+    # 先按 (国家, ip:port) 排序 -> 同地区聚在一起
+    unique = sorted(set(results), key=lambda x: (x[0], x[1]))
     with open(file_path, "w", encoding="utf-8", newline="\n") as file:
-        for item in unique:
-            file.write(f"{item}\n")
+        for country, addr in unique:
+            file.write(f"{addr}#{country} {output_name}\n")
+
+
+# ========================= 主流程 =========================
 
 
 def main():
@@ -211,7 +251,7 @@ def main():
     results = scan(ip_list)
     print(f"\n扫描完成，得到 {len(results)} 个有效节点。", flush=True)
 
-    save_best_ips(results, out_file)
+    save_best_ips(results, output_name, out_file)
     print(f"已保存到 {out_file}。", flush=True)
 
 
