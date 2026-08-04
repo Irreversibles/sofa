@@ -20,8 +20,8 @@ PORTS = [443, 2053, 2083, 2087, 2096, 8443]
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
-STAGE1_CONCURRENCY = 1500
-STAGE1_TIMEOUT = 0.5
+STAGE1_CONCURRENCY = 800
+STAGE1_TIMEOUT = 1.5
 CF_HOST_TEST = "crypto.cloudflare.com"
 
 try:
@@ -131,7 +131,7 @@ def check_http_via_curl(ip, port, host, timeout_val):
         "curl", "-I", "-s",
         "-o", "/dev/null",
         "-w", "%{http_code}",
-        "--connect-timeout", "2",
+        "--connect-timeout", "3",
         "-m", str(int(timeout_val)),
         "--resolve", f"{host}:{port}:{ip}",
         f"https://{host}:{port}/",
@@ -194,17 +194,16 @@ async def run_stage1_worker_queue(ip_list):
 async def full_check(ip, first_port):
     """从粗筛通过的端口开始，逐端口做 HTTP301 + 域名验证，命中即返回。"""
     loop = asyncio.get_running_loop()
-    # 把粗筛通过的端口放最前，其余端口补后面
     ordered_ports = [first_port] + [p for p in PORTS if p != first_port]
     for port in ordered_ports:
         ok_http = await loop.run_in_executor(
-            custom_executor, check_http_via_curl, ip, port, CF_HOST_TEST, 3.0
+            custom_executor, check_http_via_curl, ip, port, CF_HOST_TEST, 4.0
         )
         if not ok_http:
             continue
         if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
             ok_domain = await loop.run_in_executor(
-                custom_executor, check_tls_sni, ip, port, CUSTOM_CF_DOMAIN.strip(), 2.0
+                custom_executor, check_tls_sni, ip, port, CUSTOM_CF_DOMAIN.strip(), 3.0
             )
             if not ok_domain:
                 continue
