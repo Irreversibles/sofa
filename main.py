@@ -24,19 +24,34 @@ HTTP_DOMAIN = "crypto.cloudflare.com"
 # 第三步使用自己托管在 Cloudflare 上的域名验证证书
 CUSTOM_DOMAIN = "zeroo.ccwu.cc"
 
-# 输入、输出文件
+# 输入文件
 IP_FILE = "ip.txt"
-BESTIP_FILE = "bestip.txt"
 
 
-def load_ip_list(file_path: str) -> list[str]:
-    """从文件读取 IP 或 CIDR 网段；网段自动展开成单个 IP。忽略空行和 # 注释。"""
+def load_ip_list(file_path: str):
+    """读取 ip.txt。
+    第一行若为 # 注释，作为输出文件名（如 # DMIT -> DMIT.txt）。
+    其余行为 IP 或 CIDR 网段，网段自动展开成单个 IP。
+    返回 (ip_list, output_name)。
+    """
+    output_name = "bestip"  # 默认名（第一行没写就用这个）
+    ip_list = []
+
     with open(file_path, "r", encoding="utf-8") as file:
-        ip_list = []
-        for line in file:
+        for i, line in enumerate(file):
+            stripped = line.strip()
+
+            # 第一行的注释作为输出文件名
+            if i == 0 and stripped.startswith("#"):
+                name = stripped.lstrip("#").strip()
+                if name:
+                    output_name = name
+                continue
+
             item = line.split("#", 1)[0].strip()
             if not item:
                 continue
+
             if "/" in item:
                 # CIDR 网段，展开成一个个 IP
                 try:
@@ -46,7 +61,8 @@ def load_ip_list(file_path: str) -> list[str]:
                     print(f"[警告] 无效网段，已跳过: {item}", flush=True)
             else:
                 ip_list.append(item)
-        return ip_list
+
+    return ip_list, output_name
 
 
 def create_tls_connection(
@@ -164,7 +180,7 @@ def check_custom_domain(ip: str, port: int) -> bool:
 # ========================= 单个 IP 检测：多端口，命中即停 =========================
 
 
-def probe_ip(ip: str) -> str | None:
+def probe_ip(ip: str):
     """依次尝试各端口，第一个通过三步验证的端口即返回 'ip:port'，否则 None。"""
     for port in PORTS:
         if (
@@ -176,7 +192,7 @@ def probe_ip(ip: str) -> str | None:
     return None
 
 
-def scan(ip_list: list[str]) -> list[str]:
+def scan(ip_list):
     """并发扫描所有 IP，返回通过验证的 'ip:port' 列表。"""
     results = []
 
@@ -201,8 +217,8 @@ def scan(ip_list: list[str]) -> list[str]:
 # ========================= 保存结果 =========================
 
 
-def save_best_ips(results: list[str], file_path: str) -> None:
-    """将有效 ip:port 保存到 bestip.txt，每行一个并覆盖旧结果。"""
+def save_best_ips(results, file_path):
+    """将有效 ip:port 保存到文件，每行一个并覆盖旧结果。"""
     unique = sorted(set(results))
     with open(file_path, "w", encoding="utf-8", newline="\n") as file:
         for item in unique:
@@ -213,14 +229,20 @@ def save_best_ips(results: list[str], file_path: str) -> None:
 
 
 def main() -> None:
-    ip_list = load_ip_list(IP_FILE)
-    print(f"开始扫描 {len(ip_list)} 个 IP，端口: {PORTS}\n", flush=True)
+    ip_list, output_name = load_ip_list(IP_FILE)
+    out_file = f"{output_name}.txt"
+
+    print(
+        f"开始扫描 {len(ip_list)} 个 IP，端口: {PORTS}，"
+        f"结果将保存到 {out_file}\n",
+        flush=True,
+    )
 
     results = scan(ip_list)
     print(f"\n扫描完成，得到 {len(results)} 个有效节点。", flush=True)
 
-    save_best_ips(results, BESTIP_FILE)
-    print(f"已保存到 {BESTIP_FILE}。", flush=True)
+    save_best_ips(results, out_file)
+    print(f"已保存到 {out_file}。", flush=True)
 
 
 if __name__ == "__main__":
