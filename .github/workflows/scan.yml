@@ -27,4 +27,8 @@ jobs:
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
         git add *.txt
-        git diff --staged --quiet || (git commit -m "auto: update result" && git push)
+        git diff --staged --quiet && echo "无变化，跳过提交" || {
+          git commit -m "auto: update result"
+          git pull --rebase
+          git push
+        }
