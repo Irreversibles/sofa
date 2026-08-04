@@ -19,6 +19,14 @@ jobs:
       with:
         python-version: '3.10'
 
+    - name: 安装依赖
+      run: pip install geoip2
+
+    - name: 下载 GeoIP 数据库
+      run: |
+        curl -L -o GeoLite2-Country.mmdb \
+          https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
+
     - name: 执行 IP 扫描脚本
       run: python main.py
 
