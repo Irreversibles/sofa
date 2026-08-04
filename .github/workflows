@@ -1,1 +1,33 @@
+name: CF Reality IP Scanner
 
+on:
+  # 支持手动触发扫描
+  workflow_dispatch:
+  # （可选）支持定时自动运行，例如每天 UTC 0:00 (北京时间 8:00) 运行一次
+  # schedule:
+  #   - cron: '0 0 * * *'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 拉取仓库代码
+      uses: actions/checkout@v4
+
+    - name: 设置 Python 环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: 执行 IP 扫描脚本
+      run: |
+        python main.py
+
+    - name: 提交并推送结果 (bestip.txt)
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add bestip.txt
+        # 只有当 bestip.txt 有变化时才 commit，避免无意义提交
+        git diff --staged --quiet || (git commit -m "auto: update bestip.txt" && git push)
