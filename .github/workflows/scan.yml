@@ -3,14 +3,18 @@ name: CF ASN IP Scanner
 on:
   workflow_dispatch:
     inputs:
-      asn_input:
-        description: '输入 ASN 号(如AS906) 或 文件名(如ip.txt)'
+      target:
+        description: '目标: ASN(如AS906)/网段/IP/文件(如ip.txt)'
         required: true
         default: 'AS13335'
       name_label:
-        description: '输出名字/文件名 (如: DMIT)'
+        description: '名字 (如 DMIT)'
         required: true
         default: 'RESULT'
+      ports:
+        description: '端口(逗号分隔,留空用默认)'
+        required: false
+        default: '443,2053,2083,2096,8443'
 
 jobs:
   scan:
@@ -37,13 +41,13 @@ jobs:
         run: |
           curl -L -o GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
 
-      - name: Run ASN Scan
+      - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
           EDT_PATH: ${{ secrets.EDT_PATH }}
           EDT_KEYWORD: ${{ secrets.EDT_KEYWORD }}
         run: |
-          python check_cf_asn.py "${{ github.event.inputs.asn_input }}" "${{ github.event.inputs.name_label }}"
+          python check_cf_asn.py "${{ github.event.inputs.target }}" "${{ github.event.inputs.name_label }}" "${{ github.event.inputs.ports }}"
 
       - name: Push result to private repo
         env:
@@ -57,5 +61,3 @@ jobs:
           git add *.txt
           git diff --staged --quiet && echo "no change" || {
             git commit -m "auto: update scan result"
-            git push
-          }
