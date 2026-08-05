@@ -202,7 +202,7 @@ async def check_tls_async(ip, port, sni, timeout, sem):
 
 
 async def check_edt_async(ip, port, domain, timeout, sem):
-    """异步访问 域名+EDT_PATH，检查响应含 EDT_KEYWORD。"""
+    """异步访问 /admin，验证是否返回 302 跳转（真正到达EDT）。"""
     async with sem:
         writer = None
         try:
@@ -218,15 +218,12 @@ async def check_edt_async(ip, port, domain, timeout, sem):
             )
             writer.write(req.encode('latin1'))
             await writer.drain()
-
-            data = b""
-            while len(data) < 131072:
-                chunk = await asyncio.wait_for(reader.read(8192), timeout=timeout)
-                if not chunk:
-                    break
-                data += chunk
-            body = data.decode('latin1', errors='ignore').lower()
-            return EDT_KEYWORD.lower() in body if EDT_KEYWORD else True
+            data = await asyncio.wait_for(reader.read(2048), timeout=timeout)
+            resp = data.decode('latin1', errors='ignore').lower()
+            first_line = resp.split("\r\n", 1)[0]
+            has_redirect = "301" in first_line or "302" in first_line
+            has_keyword = EDT_KEYWORD.lower() in resp if EDT_KEYWORD else True
+            return has_redirect and has_keyword
         except Exception:
             return False
         finally:
