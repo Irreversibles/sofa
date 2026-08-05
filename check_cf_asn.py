@@ -16,10 +16,8 @@ DEFAULT_ASN = os.getenv("ASN_LIST", "AS13335")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "RESULT")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 
-# 待测端口（去除 2087）
 TARGET_PORTS = [443, 2053, 2083, 2096, 8443]
 
-# EDT 后台特征关键词（访问 /admin 返回的页面里应包含此词）
 EDT_KEYWORD = "edgetunnel"
 EDT_PATH = "/admin"
 
@@ -107,6 +105,32 @@ def get_ips_from_asn(asn_input):
     return ip_list
 
 
+def load_ip_from_file(file_path):
+    """读取文件，支持单个 IP 和 CIDR 网段（不解析名字）。"""
+    ip_list = []
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                item = line.split("#", 1)[0].strip()
+                if not item:
+                    continue
+                if "/" in item:
+                    try:
+                        net = ipaddress.ip_network(item, strict=False)
+                        if net.prefixlen >= 31:
+                            ip_list.extend(str(ip) for ip in net)
+                        else:
+                            ip_list.extend(str(ip) for ip in net.hosts())
+                    except ValueError:
+                        print(f"[警告] 无效网段: {item}", flush=True)
+                else:
+                    ip_list.append(item)
+    except FileNotFoundError:
+        print(f"[-] 找不到文件 {file_path}", flush=True)
+    print(f"[+] 从文件 {file_path} 读取到 {len(ip_list)} 个待测 IP。", flush=True)
+    return ip_list
+
+
 def check_tls_sni(ip, port, sni, timeout_val):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -124,7 +148,7 @@ def check_tls_sni(ip, port, sni, timeout_val):
 
 
 def check_edt_backend(ip, port, domain, timeout_val):
-    """访问 域名/admin，检查响应是否包含 EDT 后台特征（edgetunnel）。"""
+    """访问 域名/admin，检查响应是否包含 EDT 后台特征。"""
     cmd = [
         "curl", "-s", "-L",
         "--connect-timeout", "4",
@@ -196,14 +220,21 @@ async def run_stage1_worker_queue(targets):
 
 
 async def main():
-    asn_raw = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ASN
+    input_arg = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ASN
     name_label = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
 
-    asn_clean = asn_raw.strip().upper()
-    if not asn_clean.startswith("AS"):
-        asn_clean = f"AS{asn_clean}"
+    arg = input_arg.strip()
+    upper = arg.upper()
 
-    all_ips = get_ips_from_asn(asn_clean)
+    # 判断模式：AS开头 或 纯数字 → ASN 模式；否则 → 文件模式
+    if upper.startswith("AS") or arg.isdigit():
+        asn_clean = upper if upper.startswith("AS") else f"AS{arg}"
+        print(f"[*] 模式：自动拉取 ASN {asn_clean}", flush=True)
+        all_ips = get_ips_from_asn(asn_clean)
+    else:
+        print(f"[*] 模式：读取文件 {arg}", flush=True)
+        all_ips = load_ip_from_file(arg)
+
     all_ips = list(dict.fromkeys(all_ips))
     if not all_ips:
         print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
@@ -236,16 +267,13 @@ async def main():
     results = sorted(set(results), key=lambda x: (x[0], ipaddress.ip_address(x[1]), x[2]))
 
     print("\n==================== 扫描结束 ====================", flush=True)
-    print(f"目标 ASN: {asn_clean} | 端口: {TARGET_PORTS}", flush=True)
+    print(f"输入: {arg} | 端口: {TARGET_PORTS}", flush=True)
     print(f"最终有效目标总数: {len(results)}", flush=True)
 
     output_filename = f"{name_label}.txt"
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
         for country, ip, port in results:
             f.write(f"{ip}:{port}#{country} {name_label}\n")
-
     print(f"\n[+] 结果已保存至：{output_filename}", flush=True)
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())            
