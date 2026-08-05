@@ -202,8 +202,9 @@ async def check_tls_async(ip, port, sni, timeout, sem):
 
 
 async def check_edt_async(ip, port, domain, timeout, sem):
-    """异步访问 /admin，验证是否返回 302 跳转（真正到达EDT）。"""
+    """两步验证：1) /admin 返回302跳转  2) /login 页含 EDT_KEYWORD(edgetunnel)。"""
     async with sem:
+        # 第一步：访问 /admin，确认返回 301/302 跳转
         writer = None
         try:
             reader, writer = await asyncio.wait_for(
@@ -211,7 +212,7 @@ async def check_edt_async(ip, port, domain, timeout, sem):
                 timeout=timeout,
             )
             req = (
-                f"GET {EDT_PATH} HTTP/1.1\r\n"
+                f"GET /admin HTTP/1.1\r\n"
                 f"Host: {domain}\r\n"
                 f"User-Agent: Mozilla/5.0\r\n"
                 f"Connection: close\r\n\r\n"
@@ -221,9 +222,10 @@ async def check_edt_async(ip, port, domain, timeout, sem):
             data = await asyncio.wait_for(reader.read(2048), timeout=timeout)
             resp = data.decode('latin1', errors='ignore').lower()
             first_line = resp.split("\r\n", 1)[0]
-            has_redirect = "301" in first_line or "302" in first_line
-            has_keyword = EDT_KEYWORD.lower() in resp if EDT_KEYWORD else True
-            return has_redirect and has_keyword
+            if not ("301" in first_line or "302" in first_line):
+                return False
+            if "login" not in resp:
+                return False
         except Exception:
             return False
         finally:
@@ -231,6 +233,41 @@ async def check_edt_async(ip, port, domain, timeout, sem):
                 writer.close()
                 try:
                     await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+                except Exception:
+                    pass
+
+        # 第二步：访问 /login，验证页面含关键词(edgetunnel)
+        writer2 = None
+        try:
+            reader2, writer2 = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=domain),
+                timeout=timeout,
+            )
+            req2 = (
+                f"GET /login HTTP/1.1\r\n"
+                f"Host: {domain}\r\n"
+                f"User-Agent: Mozilla/5.0\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            writer2.write(req2.encode('latin1'))
+            await writer2.drain()
+            data2 = b""
+            while len(data2) < 65536:
+                chunk = await asyncio.wait_for(reader2.read(8192), timeout=timeout)
+                if not chunk:
+                    break
+                data2 += chunk
+            body = data2.decode('latin1', errors='ignore').lower()
+            if not EDT_KEYWORD:
+                return True
+            return EDT_KEYWORD.lower() in body
+        except Exception:
+            return False
+        finally:
+            if writer2:
+                writer2.close()
+                try:
+                    await asyncio.wait_for(writer2.wait_closed(), timeout=0.5)
                 except Exception:
                     pass
 
