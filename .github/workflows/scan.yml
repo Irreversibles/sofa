@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       asn_input:
-        description: '输入 ASN 号 (如: AS906)'
+        description: '输入 ASN 号(如AS906) 或 文件名(如ip.txt)'
         required: true
         default: 'AS13335'
       name_label:
@@ -43,13 +43,17 @@ jobs:
         run: |
           python check_cf_asn.py "${{ github.event.inputs.asn_input }}" "${{ github.event.inputs.name_label }}"
 
-      - name: Commit and Push Results
+      - name: Push result to private repo
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          cp *.txt result_repo/ 2>/dev/null || true
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
           git add *.txt
-          git diff --staged --quiet && echo "no change" || {
-            git commit -m "auto: update scan result [skip ci]"
-            git pull --rebase
+          git diff --staged --quiet && echo "无变化，跳过" || {
+            git commit -m "auto: update scan result"
             git push
           }
