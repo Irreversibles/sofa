@@ -11,15 +11,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import geoip2.database
 
-# ==================== 配置区域 ====================
+# ==================== 配置区域（敏感信息全从 Secret 读） ====================
 DEFAULT_ASN = os.getenv("ASN_LIST", "AS13335")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "RESULT")
-CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
+CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
+EDT_PATH = os.getenv("EDT_PATH", "/")
+EDT_KEYWORD = os.getenv("EDT_KEYWORD", "")
 
 TARGET_PORTS = [443, 2053, 2083, 2096, 8443]
-
-EDT_KEYWORD = "edgetunnel"
-EDT_PATH = "/admin"
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
@@ -55,7 +54,7 @@ def get_country(ip):
 def get_ips_from_asn(asn_input):
     asn_clean = asn_input.strip().upper().replace("AS", "")
     if not asn_clean.isdigit():
-        print(f"[-] 无效的 ASN 输入: {asn_input}", flush=True)
+        print(f"[-] 无效的 ASN 输入", flush=True)
         return []
 
     print(f"[*] 正在自动查询并拉取 AS{asn_clean} 的网段信息...", flush=True)
@@ -106,7 +105,6 @@ def get_ips_from_asn(asn_input):
 
 
 def load_ip_from_file(file_path):
-    """读取文件，支持单个 IP 和 CIDR 网段（不解析名字）。"""
     ip_list = []
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -122,12 +120,12 @@ def load_ip_from_file(file_path):
                         else:
                             ip_list.extend(str(ip) for ip in net.hosts())
                     except ValueError:
-                        print(f"[警告] 无效网段: {item}", flush=True)
+                        print(f"[警告] 无效网段", flush=True)
                 else:
                     ip_list.append(item)
     except FileNotFoundError:
-        print(f"[-] 找不到文件 {file_path}", flush=True)
-    print(f"[+] 从文件 {file_path} 读取到 {len(ip_list)} 个待测 IP。", flush=True)
+        print(f"[-] 找不到文件", flush=True)
+    print(f"[+] 从文件读取到 {len(ip_list)} 个待测 IP。", flush=True)
     return ip_list
 
 
@@ -148,7 +146,6 @@ def check_tls_sni(ip, port, sni, timeout_val):
 
 
 def check_edt_backend(ip, port, domain, timeout_val):
-    """访问 域名/admin，检查响应是否包含 EDT 后台特征。"""
     cmd = [
         "curl", "-s", "-L",
         "--connect-timeout", "4",
@@ -185,7 +182,7 @@ async def run_stage1_worker_queue(targets):
     for item in targets:
         queue.put_nowait(item)
 
-    print(f"\n[1/2 第一阶段 TLS 探测] 开始测试，共 {total} 个目标 (IP:端口组合)...", flush=True)
+    print(f"\n[1/2 第一阶段 TLS 探测] 开始测试，共 {total} 个目标...", flush=True)
     loop = asyncio.get_running_loop()
 
     async def worker():
@@ -226,13 +223,12 @@ async def main():
     arg = input_arg.strip()
     upper = arg.upper()
 
-    # 判断模式：AS开头 或 纯数字 → ASN 模式；否则 → 文件模式
     if upper.startswith("AS") or arg.isdigit():
         asn_clean = upper if upper.startswith("AS") else f"AS{arg}"
         print(f"[*] 模式：自动拉取 ASN {asn_clean}", flush=True)
         all_ips = get_ips_from_asn(asn_clean)
     else:
-        print(f"[*] 模式：读取文件 {arg}", flush=True)
+        print(f"[*] 模式：读取文件", flush=True)
         all_ips = load_ip_from_file(arg)
 
     all_ips = list(dict.fromkeys(all_ips))
@@ -254,26 +250,23 @@ async def main():
         return
 
     domain = CUSTOM_CF_DOMAIN.strip()
-    print(f"[2/2 第二阶段 EDT后台校验] 访问 {domain}{EDT_PATH}，校验 {len(pass_1)} 个候选...", flush=True)
+    print(f"[2/2 第二阶段 校验] 校验 {len(pass_1)} 个候选...", flush=True)
     tasks2 = [stage2_task(item, domain) for item in pass_1]
     res2 = await asyncio.gather(*tasks2)
     final_items = [item for item in res2 if item is not None]
-    print(f"[+] 第二阶段完成！可访问 EDT 后台的有效目标: {len(final_items)} 个", flush=True)
+    print(f"[+] 第二阶段完成！有效目标: {len(final_items)} 个", flush=True)
 
     results = []
     for ip, port in final_items:
         country = get_country(ip)
         results.append((country, ip, port))
     results = sorted(set(results), key=lambda x: (x[0], ipaddress.ip_address(x[1]), x[2]))
-
     print("\n==================== 扫描结束 ====================", flush=True)
-    print(f"输入: {arg} | 端口: {TARGET_PORTS}", flush=True)
     print(f"最终有效目标总数: {len(results)}", flush=True)
-
     output_filename = f"{name_label}.txt"
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
         for country, ip, port in results:
             f.write(f"{ip}:{port}#{country} {name_label}\n")
     print(f"\n[+] 结果已保存至：{output_filename}", flush=True)
 if __name__ == "__main__":
-    asyncio.run(main())            
+    asyncio.run(main())
