@@ -59,5 +59,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add *.txt
-          git diff --staged --quiet && echo "no change" || {
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
             git commit -m "auto: update scan result"
+            git push
+          fi
