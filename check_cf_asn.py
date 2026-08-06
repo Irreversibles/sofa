@@ -4,34 +4,43 @@ import sys
 import os
 import re
 import resource
-import ipaddress
 import json
+import ipaddress
 import urllib.request
+import random
+import socket
+from concurrent.futures import ProcessPoolExecutor
 
 import geoip2.database
 
-# ==================== 配置区域（敏感信息从 Secret 读） ====================
-DEFAULT_TARGET = os.getenv("ASN_LIST", "AS13335")
+try:
+    import uvloop
+    uvloop.install()
+    UVLOOP_ENABLED = True
+except ImportError:
+    UVLOOP_ENABLED = False
+
+# ==================== 配置区域 ====================
+DEFAULT_TARGET = os.getenv("ASN_LIST", "AS36002")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "RESULT")
 DEFAULT_PORTS = os.getenv("PORTS", "443,2053,2083,2096,8443")
-
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
-EDT_PATH = os.getenv("EDT_PATH", "/login")
-EDT_KEYWORD = os.getenv("EDT_KEYWORD", "")
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
-CONCURRENCY = 1000
-STAGE1_TIMEOUT = 1.2
-STAGE_EDT_TIMEOUT = 6.0
+CF_HOST_TEST = "crypto.cloudflare.com"
+STAGE1_CONCURRENCY = 1200
+STAGE1_TIMEOUT = 1.0
+STAGE2_TIMEOUT = 1.5
+STAGE3_TIMEOUT = 1.5
+CPU_CORES = max(1, os.cpu_count() or 1)
 
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-    print(f"[*] Socket 文件描述符上限已提升至: {hard}", flush=True)
-except Exception as e:
-    print(f"[!] 提升文件描述符失败(非Linux可忽略): {e}", flush=True)
+except Exception:
+    pass
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -41,7 +50,6 @@ try:
     geo_reader = geoip2.database.Reader(GEOIP_DB)
 except Exception:
     geo_reader = None
-    print("[!] 未找到 GeoIP 数据库，地区显示 ??", flush=True)
 
 
 def get_country(ip):
@@ -56,39 +64,49 @@ def get_country(ip):
 def parse_ports(port_str):
     if not port_str:
         return [443, 2053, 2083, 2096, 8443]
-    raw = re.split(r'[\s,]+', str(port_str).strip())
-    ports = [int(p) for p in raw if p.isdigit() and 1 <= int(p) <= 65535]
-    return list(dict.fromkeys(ports)) if ports else [443, 2053, 2083, 2096, 8443]
+    ports = set()
+    parts = re.split(r'[\s,]+', str(port_str).strip())
+    for part in parts:
+        if '-' in part:
+            try:
+                start, end = part.split('-')
+                s_idx, e_idx = max(1, int(start)), min(65535, int(end))
+                if s_idx <= e_idx:
+                    ports.update(range(s_idx, e_idx + 1))
+            except ValueError:
+                continue
+        elif part.isdigit():
+            val = int(part)
+            if 1 <= val <= 65535:
+                ports.add(val)
+    return sorted(list(ports)) if ports else [443, 2053, 2083, 2096, 8443]
 
 
 def get_ips_from_asn(asn_clean):
-    print(f"[*] 正在查询 AS{asn_clean} 的网段...", flush=True)
     cidrs = []
     try:
-        url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_clean}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read().decode())
+        ripe_url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_clean}"
+        req = urllib.request.Request(ripe_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
             for p in data.get("data", {}).get("prefixes", []):
                 prefix = p.get("prefix")
                 if prefix and ":" not in prefix:
                     cidrs.append(prefix)
-    except Exception as e:
-        print(f"[!] RIPE 获取失败: {e}", flush=True)
-
+    except Exception:
+        pass
     if not cidrs:
         try:
-            url = f"https://api.bgpview.io/asn/{asn_clean}/prefixes"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode())
+            bgp_url = f"https://api.bgpview.io/asn/{asn_clean}/prefixes"
+            req = urllib.request.Request(bgp_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
                 for p in data.get("data", {}).get("ipv4_prefixes", []):
                     prefix = p.get("prefix")
                     if prefix:
                         cidrs.append(prefix)
-        except Exception as e:
-            print(f"[!] BGPView 获取失败: {e}", flush=True)
-
+        except Exception:
+            pass
     ip_list = []
     for cidr in cidrs:
         try:
@@ -119,24 +137,17 @@ def load_ip_from_file(file_path):
                 except ValueError:
                     ip_list.append(item)
     except FileNotFoundError:
-        print(f"[-] 找不到文件", flush=True)
+        print("[-] 找不到文件", flush=True)
     return ip_list
 
 
 def parse_targets(input_str):
-    """智能解析：文件名 / ASN / CIDR / 单IP。"""
+    raw_targets = [t.strip() for t in re.split(r'[\s,]+', input_str) if t.strip()]
     all_ips = []
-    raw = [t.strip() for t in re.split(r'[\s,]+', input_str) if t.strip()]
-
-    for item in raw:
-        # 文件模式：以 .txt 结尾
+    for item in raw_targets:
         if item.lower().endswith(".txt"):
-            print(f"[*] 模式：读取文件", flush=True)
-            ips = load_ip_from_file(item)
-            print(f"[+] 从文件读取到 {len(ips)} 个 IP", flush=True)
-            all_ips.extend(ips)
+            all_ips.extend(load_ip_from_file(item))
             continue
-        # 网段/单IP
         try:
             net = ipaddress.ip_network(item, strict=False)
             if net.prefixlen >= 31:
@@ -146,18 +157,12 @@ def parse_targets(input_str):
             continue
         except ValueError:
             pass
-        # ASN
         asn_clean = item.upper().replace("AS", "")
         if asn_clean.isdigit():
-            ips = get_ips_from_asn(asn_clean)
-            print(f"[+] AS{asn_clean} 提取出 {len(ips)} 个 IP", flush=True)
-            all_ips.extend(ips)
-        else:
-            print(f"[-] 无法识别的目标格式", flush=True)
-
-    unique = list(dict.fromkeys(all_ips))
-    print(f"[+] 去重后共 {len(unique)} 个待测 IP", flush=True)
-    return unique
+            all_ips.extend(get_ips_from_asn(asn_clean))
+    unique_ips = list(dict.fromkeys(all_ips))
+    random.shuffle(unique_ips)
+    return unique_ips
 
 
 def match_domain_in_cert(sni_domain, cert_str):
@@ -167,28 +172,28 @@ def match_domain_in_cert(sni_domain, cert_str):
         return True
     parts = sni_domain.split(".")
     if len(parts) >= 2:
-        main = ".".join(parts[-2:])
-        if main in cert_str or f"*.{main}" in cert_str:
+        main_domain = ".".join(parts[-2:])
+        if main_domain in cert_str or f"*.{main_domain}" in cert_str:
             return True
     if "cloudflare" in sni_domain and "cloudflare" in cert_str:
         return True
     return False
 
 
-async def check_tls_async(ip, port, sni, timeout, sem):
-    """异步 TLS 握手 + 证书匹配（粗筛用）。"""
+async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
     async with sem:
         writer = None
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=sni),
-                timeout=timeout,
-            )
+            conn = asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=sni)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout_val)
+            sock = writer.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             ssl_obj = writer.get_extra_info('ssl_object')
-            der = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
-            if not der:
+            der_cert = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
+            if not der_cert:
                 return False
-            cert_str = der.decode('latin1', errors='ignore').lower()
+            cert_str = der_cert.decode('latin1', errors='ignore').lower()
             return match_domain_in_cert(sni, cert_str)
         except Exception:
             return False
@@ -196,115 +201,53 @@ async def check_tls_async(ip, port, sni, timeout, sem):
             if writer:
                 writer.close()
                 try:
-                    await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+                    await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
                 except Exception:
                     pass
 
 
-async def check_edt_async(ip, port, domain, timeout, sem):
-    """两步验证：1) /admin 返回302跳转  2) /login 页含 EDT_KEYWORD(edgetunnel)。"""
+async def check_http_async(ip, port, host, timeout_val, sem):
     async with sem:
-        # 第一步：访问 /admin，确认返回 301/302 跳转
         writer = None
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=domain),
-                timeout=timeout,
-            )
-            req = (
-                f"GET /admin HTTP/1.1\r\n"
-                f"Host: {domain}\r\n"
-                f"User-Agent: Mozilla/5.0\r\n"
-                f"Connection: close\r\n\r\n"
-            )
+            conn = asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=host)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout_val)
+            sock = writer.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            req = f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
             writer.write(req.encode('latin1'))
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(2048), timeout=timeout)
-            resp = data.decode('latin1', errors='ignore').lower()
-            first_line = resp.split("\r\n", 1)[0]
-            if not ("301" in first_line or "302" in first_line):
+            data = await asyncio.wait_for(reader.read(1024), timeout=timeout_val)
+            if not data:
                 return False
-            if "login" not in resp:
-                return False
+            resp_str = data.decode('latin1', errors='ignore').lower()
+            has_redirect = "http/1.1 301" in resp_str or "http/1.1 302" in resp_str
+            has_location = "location:" in resp_str
+            return has_redirect and has_location
         except Exception:
             return False
         finally:
             if writer:
                 writer.close()
                 try:
-                    await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
-                except Exception:
-                    pass
-
-        # 第二步：访问 /login，验证页面含关键词(edgetunnel)
-        writer2 = None
-        try:
-            reader2, writer2 = await asyncio.wait_for(
-                asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=domain),
-                timeout=timeout,
-            )
-            req2 = (
-                f"GET /login HTTP/1.1\r\n"
-                f"Host: {domain}\r\n"
-                f"User-Agent: Mozilla/5.0\r\n"
-                f"Connection: close\r\n\r\n"
-            )
-            writer2.write(req2.encode('latin1'))
-            await writer2.drain()
-            data2 = b""
-            while len(data2) < 65536:
-                chunk = await asyncio.wait_for(reader2.read(8192), timeout=timeout)
-                if not chunk:
-                    break
-                data2 += chunk
-            body = data2.decode('latin1', errors='ignore').lower()
-            if not EDT_KEYWORD:
-                return True
-            return EDT_KEYWORD.lower() in body
-        except Exception:
-            return False
-        finally:
-            if writer2:
-                writer2.close()
-                try:
-                    await asyncio.wait_for(writer2.wait_closed(), timeout=0.5)
+                    await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
                 except Exception:
                     pass
 
 
-async def run_stage1(targets, sem):
-    total = len(targets)
-    completed = 0
-    passed = []
-    step = max(1, total // 10)
-    last_step = 0
+def _process_worker_stage1(targets_chunk):
+    if UVLOOP_ENABLED:
+        uvloop.install()
 
-    print(f"\n[1/2 第一阶段 TLS 探测] 共 {total} 个目标...", flush=True)
-    queue = asyncio.Queue()
-    for item in targets:
-        queue.put_nowait(item)
+    async def _run():
+        sem = asyncio.Semaphore(STAGE1_CONCURRENCY)
+        tasks = [check_tls_sni_async(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem)
+                 for ip, port in targets_chunk]
+        results = await asyncio.gather(*tasks)
+        return [targets_chunk[i] for i, ok in enumerate(results) if ok]
 
-    async def worker():
-        nonlocal completed, last_step
-        while not queue.empty():
-            try:
-                ip, port = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            ok = await check_tls_async(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem)
-            completed += 1
-            if ok:
-                passed.append((ip, port))
-            cur = completed // step
-            if cur > last_step or completed == total:
-                last_step = cur
-                pct = completed / total * 100
-                print(f"[1/2 进度] {completed}/{total} ({pct:.1f}%) | 通过: {len(passed)}", flush=True)
-            queue.task_done()
-
-    workers = [asyncio.create_task(worker()) for _ in range(min(CONCURRENCY, total))]
-    await asyncio.gather(*workers)
-    return passed
+    return asyncio.run(_run())
 
 
 async def main():
@@ -315,43 +258,70 @@ async def main():
     target_ports = parse_ports(ports_input)
     all_ips = parse_targets(target_input)
     if not all_ips:
-        print("[-] 未获取到任何待测 IP，退出。", flush=True)
+        print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
         return
 
     targets = [(ip, port) for ip in all_ips for port in target_ports]
-    print(f"[*] {len(all_ips)} IP × {len(target_ports)} 端口 = {len(targets)} 个目标。端口: {target_ports}", flush=True)
+    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 进程数={CPU_CORES}", flush=True)
+    print(f"[*] {len(all_ips)} IP × {len(target_ports)} 端口 = 共 {len(targets):,} 个目标。", flush=True)
 
-    sem = asyncio.Semaphore(CONCURRENCY)
-
-    pass_1 = await run_stage1(targets, sem)
+    # 第一阶段：多进程 TLS 粗筛
+    print(f"\n[1/3 第一阶段 TLS 探测] 多进程并发中...", flush=True)
+    chunk_size = max(1, len(targets) // CPU_CORES)
+    chunks = [targets[i:i + chunk_size] for i in range(0, len(targets), chunk_size)]
+    pass_1 = []
+    loop = asyncio.get_running_loop()
+    with ProcessPoolExecutor(max_workers=CPU_CORES) as executor:
+        futures = [loop.run_in_executor(executor, _process_worker_stage1, chunk) for chunk in chunks]
+        results = await asyncio.gather(*futures)
+        for res in results:
+            pass_1.extend(res)
     print(f"[+] 第一阶段完成！保留: {len(pass_1)} 个\n", flush=True)
     if not pass_1:
-        print("[-] 无有效目标。", flush=True)
+        print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
-    domain = CUSTOM_CF_DOMAIN.strip()
-    print(f"[2/2 第二阶段 校验] 校验 {len(pass_1)} 个候选...", flush=True)
-    tasks = [check_edt_async(ip, port, domain, STAGE_EDT_TIMEOUT, sem) for ip, port in pass_1]
-    res = await asyncio.gather(*tasks)
-    final_items = [pass_1[i] for i, ok in enumerate(res) if ok]
-    print(f"[+] 第二阶段完成！有效目标: {len(final_items)} 个", flush=True)
+    # 第二阶段：crypto.cloudflare.com HTTP 301（不消耗你的额度）
+    sem = asyncio.Semaphore(STAGE1_CONCURRENCY)
+    print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1)} 个候选...", flush=True)
+    tasks2 = [check_http_async(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem) for ip, port in pass_1]
+    res2 = await asyncio.gather(*tasks2)
+    pass_2 = [pass_1[i] for i, ok in enumerate(res2) if ok]
+    print(f"[+] 第二阶段完成！保留: {len(pass_2)} 个\n", flush=True)
+    if not pass_2:
+        print("[-] 无有效目标通过第二阶段。", flush=True)
+        return
 
-    results = []
+    # 第三阶段：TLS 握手你的域名（不消耗你的额度）
+    final_items = pass_2
+    if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
+        domain = CUSTOM_CF_DOMAIN.strip()
+        print(f"[3/3 第三阶段自定义域名校验] 校验 {len(pass_2)} 个...", flush=True)
+        tasks3 = [check_tls_sni_async(ip, port, domain, STAGE3_TIMEOUT, sem) for ip, port in pass_2]
+        res3 = await asyncio.gather(*tasks3)
+        final_items = [pass_2[i] for i, ok in enumerate(res3) if ok]
+        print(f"[+] 第三阶段完成！有效目标: {len(final_items)} 个", flush=True)
+    else:
+        print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，跳过。", flush=True)
+
+    # 加地区，按 (地区, ip, 端口) 排序
+    results_out = []
     for ip, port in final_items:
         country = get_country(ip)
-        results.append((country, ip, port))
-    results = sorted(set(results), key=lambda x: (x[0], ipaddress.ip_address(x[1]), x[2]))
+        results_out.append((country, ip, port))
+    results_out = sorted(set(results_out),
+                         key=lambda x: (x[0], ipaddress.ip_address(x[1]), x[2]))
 
     print("\n==================== 扫描结束 ====================", flush=True)
-    print(f"最终有效目标总数: {len(results)}", flush=True)
+    print(f"最终有效目标总数: {len(results_out)}", flush=True)
 
     output_filename = f"{name_label}.txt"
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
-        for country, ip, port in results:
+        for country, ip, port in results_out:
             f.write(f"{ip}:{port}#{country} {name_label}\n")
 
     print(f"\n[+] 结果已保存至：{output_filename}", flush=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())    
+    asyncio.run(main())
