@@ -83,7 +83,17 @@ def parse_ports(port_str):
 
 
 def get_asn_name(asn_clean):
-    """从 API 获取 ASN 名字（用于自动命名）。"""
+    """获取 ASN 名字（RIPE holder，备用 bgpview）。"""
+    try:
+        url = f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn_clean}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode()).get("data", {})
+            holder = data.get("holder", "")
+            if holder:
+                return holder
+    except Exception:
+        pass
     try:
         url = f"https://api.bgpview.io/asn/{asn_clean}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -95,10 +105,10 @@ def get_asn_name(asn_clean):
 
 
 def simplify_name(full_name):
-    """把 ASN 全称简化成简称（去掉公司后缀，取主名）。"""
+    """简化 ASN 名字成简称。"""
     if not full_name:
         return ""
-    name = full_name
+    name = full_name.split(" - ")[0].strip()
     suffixes = [
         "Cloud Services", "Cloud Computing", "Cloud", "Networks", "Network",
         "Technologies", "Technology", "Communications", "Communication",
@@ -109,11 +119,11 @@ def simplify_name(full_name):
     ]
     for suf in suffixes:
         name = re.sub(rf'\b{re.escape(suf)}\b', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'[-_]?AS$', '', name, flags=re.IGNORECASE)
     name = name.replace(",", " ").strip()
     parts = name.split()
     if parts:
         return parts[0]
-    # 全被去掉了，退回原全称第一个词
     return full_name.split()[0] if full_name.split() else "RESULT"
 
 
