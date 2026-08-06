@@ -53,7 +53,7 @@ jobs:
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
           for f in *.txt; do
-            if [ "$f" != "ip.txt" ]; then
+            if [ "$f" != "ip.txt" ] && [ "$f" != "requirements.txt" ]; then
               cp "$f" result_repo/ 2>/dev/null || true
             fi
           done
