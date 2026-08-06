@@ -1,2 +1,1 @@
-geoip2>=4.0.0
-uvloop
+aiohttp>=3.8.0
