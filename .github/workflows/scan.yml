@@ -4,17 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: '目标: ASN(如906)/网段/IP/文件(如ip.txt)'
+        description: '目标 ASN/网段/IP (如 906 或 906,32519)'
         required: true
         default: 'AS36002'
-      name_label:
-        description: '名字(填auto自动识别, 或手动填如DMIT)'
-        required: false
-        default: 'auto'
       ports:
-        description: '端口(逗号分隔,留空默认)'
+        description: '端口(逗号分隔)'
         required: false
-        default: '443,2053,2083,2096,8443'
+        default: '443,8443,2053,2083,2096'
 
 jobs:
   scan:
@@ -22,48 +18,29 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: write
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
       - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Download GeoIP Database
-        run: |
-          curl -L -o GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
-
+        run: pip install -r requirements.txt
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-        run: |
-          python check_cf_asn.py "${{ github.event.inputs.target }}" "${{ github.event.inputs.name_label }}" "${{ github.event.inputs.ports }}"
-
-      - name: Push result to private repo
+        run: python check_cf_asn.py "${{ github.event.inputs.target }}" "${{ github.event.inputs.ports }}"
+      - name: Push to private repo
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
           for f in *.txt; do
-            if [ "$f" != "ip.txt" ]; then
-              cp "$f" result_repo/ 2>/dev/null || true
-            fi
+            if [ "$f" != "ip.txt" ]; then cp "$f" result_repo/ 2>/dev/null || true; fi
           done
           cd result_repo
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "bot"
           git add *.txt
-          if git diff --staged --quiet; then
-            echo "no change"
-          else
-            git commit -m "auto: update result"
-            git push
-          fi
+          if git diff --staged --quiet; then echo "no change"; else git commit -m "update" && git push; fi
