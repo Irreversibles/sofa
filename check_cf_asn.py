@@ -22,7 +22,7 @@ except ImportError:
 
 # ==================== 配置区域 ====================
 DEFAULT_TARGET = os.getenv("ASN_LIST", "AS36002")
-DEFAULT_NAME = os.getenv("NAME_LABEL", "RESULT")
+DEFAULT_NAME = os.getenv("NAME_LABEL", "auto")
 DEFAULT_PORTS = os.getenv("PORTS", "443,2053,2083,2096,8443")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 
@@ -80,6 +80,41 @@ def parse_ports(port_str):
             if 1 <= val <= 65535:
                 ports.add(val)
     return sorted(list(ports)) if ports else [443, 2053, 2083, 2096, 8443]
+
+
+def get_asn_name(asn_clean):
+    """从 API 获取 ASN 名字（用于自动命名）。"""
+    try:
+        url = f"https://api.bgpview.io/asn/{asn_clean}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode()).get("data", {})
+            return data.get("name") or data.get("description_short") or ""
+    except Exception:
+        return ""
+
+
+def simplify_name(full_name):
+    """把 ASN 全称简化成简称（去掉公司后缀，取主名）。"""
+    if not full_name:
+        return ""
+    name = full_name
+    suffixes = [
+        "Cloud Services", "Cloud Computing", "Cloud", "Networks", "Network",
+        "Technologies", "Technology", "Communications", "Communication",
+        "International", "Global", "Group", "Holdings", "Solutions",
+        "Data Center", "Datacenter", "Hosting", "Internet", "Services",
+        "LLC", "L.L.C", "Ltd.", "Ltd", "Limited", "Inc.", "Inc",
+        "Co.,", "Co.", "Corporation", "Corp.", "Corp", "GmbH", "S.A.", "B.V.",
+    ]
+    for suf in suffixes:
+        name = re.sub(rf'\b{re.escape(suf)}\b', '', name, flags=re.IGNORECASE)
+    name = name.replace(",", " ").strip()
+    parts = name.split()
+    if parts:
+        return parts[0]
+    # 全被去掉了，退回原全称第一个词
+    return full_name.split()[0] if full_name.split() else "RESULT"
 
 
 def get_ips_from_asn(asn_clean):
@@ -250,10 +285,28 @@ def _process_worker_stage1(targets_chunk):
     return asyncio.run(_run())
 
 
+def resolve_name(target_input, name_arg):
+    """决定输出名字：填了用填的；否则对第一个ASN自动取名简化。"""
+    if name_arg and name_arg.lower() != "auto":
+        return name_arg
+    first = target_input.strip().split(",")[0].strip()
+    asn_clean = first.upper().replace("AS", "")
+    if asn_clean.isdigit():
+        api_name = get_asn_name(asn_clean)
+        simple = simplify_name(api_name)
+        if simple:
+            print(f"[*] 自动识别 AS{asn_clean} -> {simple} (原名: {api_name})", flush=True)
+            return simple
+        return f"AS{asn_clean}"
+    return "RESULT"
+
+
 async def main():
     target_input = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET
-    name_label = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
+    name_arg = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
     ports_input = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_PORTS
+
+    name_label = resolve_name(target_input, name_arg)
 
     target_ports = parse_ports(ports_input)
     all_ips = parse_targets(target_input)
@@ -262,7 +315,7 @@ async def main():
         return
 
     targets = [(ip, port) for ip in all_ips for port in target_ports]
-    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 进程数={CPU_CORES}", flush=True)
+    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 进程数={CPU_CORES} | 名字={name_label}", flush=True)
     print(f"[*] {len(all_ips)} IP × {len(target_ports)} 端口 = 共 {len(targets):,} 个目标。", flush=True)
 
     # 第一阶段：多进程 TLS 粗筛
@@ -281,7 +334,7 @@ async def main():
         print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
-    # 第二阶段：crypto.cloudflare.com HTTP 301（不消耗你的额度）
+    # 第二阶段：crypto.cloudflare.com HTTP 301（不消耗你额度）
     sem = asyncio.Semaphore(STAGE1_CONCURRENCY)
     print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1)} 个候选...", flush=True)
     tasks2 = [check_http_async(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem) for ip, port in pass_1]
@@ -292,7 +345,7 @@ async def main():
         print("[-] 无有效目标通过第二阶段。", flush=True)
         return
 
-    # 第三阶段：TLS 握手你的域名（不消耗你的额度）
+    # 第三阶段：TLS 握手你的域名（不消耗你额度）
     final_items = pass_2
     if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
         domain = CUSTOM_CF_DOMAIN.strip()
@@ -324,4 +377,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())    
