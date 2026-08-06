@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: '目标: ASN(如AS906)/网段/IP/文件(如ip.txt)'
+        description: '目标: ASN(AS906)/网段/IP/文件(ip.txt)'
         required: true
-        default: 'AS13335'
+        default: 'AS36002'
       name_label:
         description: '名字 (如 DMIT)'
         required: true
         default: 'RESULT'
       ports:
-        description: '端口(逗号分隔,留空用默认)'
+        description: '端口(逗号分隔,留空默认)'
         required: false
         default: '443,2053,2083,2096,8443'
 
@@ -44,8 +44,6 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-          EDT_PATH: ${{ secrets.EDT_PATH }}
-          EDT_KEYWORD: ${{ secrets.EDT_KEYWORD }}
         run: |
           python check_cf_asn.py "${{ github.event.inputs.target }}" "${{ github.event.inputs.name_label }}" "${{ github.event.inputs.ports }}"
 
@@ -54,7 +52,11 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          cp *.txt result_repo/ 2>/dev/null || true
+          for f in *.txt; do
+            if [ "$f" != "ip.txt" ]; then
+              cp "$f" result_repo/ 2>/dev/null || true
+            fi
+          done
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
@@ -62,6 +64,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "no change"
           else
-            git commit -m "auto: update scan result"
+            git commit -m "auto: update result"
             git push
           fi
