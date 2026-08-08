@@ -364,6 +364,10 @@ async def main():
 
     name_label = resolve_name(target_input, name_arg)
 
+    # 把识别后的真实名字写出来，供 TG 通知读取
+    with open("name.txt", "w") as f:
+        f.write(name_label)
+
     # 选端口（按填写的来）
     target_ports = pick_ports(ports_input)
     print(f"[*] 本次使用端口({len(target_ports)}个): {target_ports}", flush=True)
@@ -486,7 +490,5 @@ async def main():
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次出货: {len(sorted_lines)} 个", flush=True)
     print(f"[+] 结果已保存至：{output_filename}（每次覆盖，仅保留最新一批）", flush=True)
-
-
 if __name__ == "__main__":
     asyncio.run(main())
