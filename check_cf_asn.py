@@ -54,8 +54,6 @@ DEFAULT_PORTS = os.getenv("PORTS", "443,8443,2053,2083,2096")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
-STATE_DIR = "state"   # 状态文件目录（抽过端口、已出货组合）
-SAMPLE_N = 50         # 每次随机抽的端口数
 
 CF_SNI_1 = "www.cloudflare.com"
 STAGE1_CONCURRENCY = 50
@@ -92,109 +90,18 @@ def get_country(ip):
         return "??"
 
 
-# ==================== 状态管理（抽过端口 / 已出货组合） ====================
-
-def _asn_key(target_input):
-    """用目标第一个ASN作为状态key"""
-    first = target_input.strip().split(",")[0].strip().split()[0].strip()
-    asn = first.upper().replace("AS", "")
-    return f"AS{asn}" if asn.isdigit() else re.sub(r'[^\w.-]', '_', first)
-
-
-def load_scanned_ports(asn_key):
-    """读取已抽过的端口集合"""
-    os.makedirs(STATE_DIR, exist_ok=True)
-    fname = os.path.join(STATE_DIR, f"scanned_ports_{asn_key}.txt")
-    ports = set()
-    try:
-        with open(fname) as f:
-            for line in f:
-                s = line.strip()
-                if s.isdigit():
-                    ports.add(int(s))
-    except FileNotFoundError:
-        pass
-    return ports
-
-
-def save_scanned_ports(asn_key, ports):
-    """覆盖写入已抽过端口"""
-    os.makedirs(STATE_DIR, exist_ok=True)
-    fname = os.path.join(STATE_DIR, f"scanned_ports_{asn_key}.txt")
-    with open(fname, "w") as f:
-        for p in sorted(ports):
-            f.write(f"{p}\n")
-
-
-def load_found_combos(asn_key):
-    """读取已出货的 ip:port 组合集合"""
-    os.makedirs(STATE_DIR, exist_ok=True)
-    fname = os.path.join(STATE_DIR, f"found_{asn_key}.txt")
-    combos = set()
-    try:
-        with open(fname) as f:
-            for line in f:
-                s = line.strip()
-                if ":" in s:
-                    combos.add(s)
-    except FileNotFoundError:
-        pass
-    return combos
-
-
-def save_found_combos(asn_key, combos):
-    """覆盖写入已出货组合"""
-    os.makedirs(STATE_DIR, exist_ok=True)
-    fname = os.path.join(STATE_DIR, f"found_{asn_key}.txt")
-    with open(fname, "w") as f:
-        for c in sorted(combos):
-            f.write(f"{c}\n")
-
-
-def pick_ports(port_str, asn_key):
-    """区间: 排除已抽过的, 随机抽SAMPLE_N个; 抽完则清空循环。非区间: 按填的。"""
+def pick_ports(port_str):
+    """按填写的端口解析（逗号/空格分隔），无有效值则用默认。"""
     if not port_str:
         return [443, 8443, 2053, 2083, 2096]
-    # 检查是否为区间
     ports = set()
     parts = re.split(r'[\s,]+', str(port_str).strip())
-    has_range = any('-' in p for p in parts)
-
-    if has_range:
-        # 收集区间所有端口
-        all_range = set()
-        for part in parts:
-            if '-' in part:
-                try:
-                    a, b = part.split('-')
-                    s, e = max(1, int(a)), min(65535, int(b))
-                    if s <= e:
-                        all_range.update(range(s, e + 1))
-                except ValueError:
-                    continue
-            elif part.isdigit():
-                all_range.add(int(part))
-
-        scanned = load_scanned_ports(asn_key)
-        available = list(all_range - scanned)
-        if len(available) < SAMPLE_N:
-            # 抽完了，清空循环
-            print(f"[*] {asn_key} 区间端口已抽完，清空记录重新循环", flush=True)
-            scanned = set()
-            available = list(all_range)
-        chosen = random.sample(available, min(SAMPLE_N, len(available)))
-        # 更新已抽过
-        scanned.update(chosen)
-        save_scanned_ports(asn_key, scanned)
-        return sorted(chosen)
-    else:
-        # 非区间，按填的
-        for part in parts:
-            if part.isdigit():
-                v = int(part)
-                if 1 <= v <= 65535:
-                    ports.add(v)
-        return sorted(ports) if ports else [443, 8443, 2053, 2083, 2096]
+    for part in parts:
+        if part.isdigit():
+            v = int(part)
+            if 1 <= v <= 65535:
+                ports.add(v)
+    return sorted(ports) if ports else [443, 8443, 2053, 2083, 2096]
 
 
 def get_asn_name(asn_clean):
@@ -456,10 +363,9 @@ async def main():
     ports_input = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_PORTS
 
     name_label = resolve_name(target_input, name_arg)
-    asn_key = _asn_key(target_input)
 
-    # 选端口（区间则排除已抽过、随机抽SAMPLE_N、抽完循环）
-    target_ports = pick_ports(ports_input, asn_key)
+    # 选端口（按填写的来）
+    target_ports = pick_ports(ports_input)
     print(f"[*] 本次使用端口({len(target_ports)}个): {target_ports}", flush=True)
 
     print(f"\n[*] 正在解析目标...", flush=True)
@@ -468,19 +374,17 @@ async def main():
         print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
         return
 
-    # 读取已出货组合，生成目标时排除这些 ip:port
-    found_combos = load_found_combos(asn_key)
+    # 生成所有 ip:port 组合
     targets = []
     for ip in all_ips:
         for port in target_ports:
-            if f"{ip}:{port}" not in found_combos:
-                targets.append((ip, port))
+            targets.append((ip, port))
 
     total_targets_count = len(targets)
     print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 进程={CPU_CORES} | 名字={name_label}", flush=True)
-    print(f"[*] {len(all_ips)} IP × {len(target_ports)} 端口，排除已出货后共 {total_targets_count:,} 个目标。", flush=True)
+    print(f"[*] {len(all_ips)} IP × {len(target_ports)} 端口，共 {total_targets_count:,} 个目标。", flush=True)
     if total_targets_count == 0:
-        print("[-] 本次无新目标（都已出货或无IP）。", flush=True)
+        print("[-] 本次无目标。", flush=True)
         return
 
     # 第一阶段
@@ -536,10 +440,6 @@ async def main():
 
     # 本次新出货的 ip:port
     new_combos = set(f"{ip}:{port}" for ip, port in final_items)
-
-    # 更新"已出货组合"（永久排除）
-    found_combos.update(new_combos)
-    save_found_combos(asn_key, found_combos)
 
     # 结果：追加去重，永久保留（读旧结果 + 新结果合并）
     output_filename = f"{name_label}.txt"
