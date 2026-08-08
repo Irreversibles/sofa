@@ -56,11 +56,14 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+
+          shopt -s nullglob
           for f in *.txt; do
             if [ "$f" != "ip.txt" ]; then
               cp "$f" result_repo/ 2>/dev/null || true
             fi
           done
+
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
@@ -68,6 +71,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "no change"
           else
+            git pull --rebase
             git commit -m "auto: update result"
             git push
           fi
