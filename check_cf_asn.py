@@ -371,6 +371,8 @@ async def main():
     print(f"\n[*] 正在解析目标...", flush=True)
     all_ips = await parse_targets_async(target_input)
     if not all_ips:
+        with open("count.txt", "w") as f:
+            f.write("0")
         print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
         return
 
@@ -384,6 +386,8 @@ async def main():
     print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 进程={CPU_CORES} | 名字={name_label}", flush=True)
     print(f"[*] {len(all_ips)} IP × {len(target_ports)} 端口，共 {total_targets_count:,} 个目标。", flush=True)
     if total_targets_count == 0:
+        with open("count.txt", "w") as f:
+            f.write("0")
         print("[-] 本次无目标。", flush=True)
         return
 
@@ -412,6 +416,8 @@ async def main():
             pass_1.extend(res)
     print(f"[+] 第一阶段完成！保留: {len(pass_1)} 个\n", flush=True)
     if not pass_1:
+        with open("count.txt", "w") as f:
+            f.write("0")
         print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
@@ -423,6 +429,8 @@ async def main():
     pass_2 = [pass_1[i] for i, ok in enumerate(res2) if ok]
     print(f"[+] 第二阶段完成！保留: {len(pass_2)} 个\n", flush=True)
     if not pass_2:
+        with open("count.txt", "w") as f:
+            f.write("0")
         print("[-] 无有效目标通过第二阶段。", flush=True)
         return
 
@@ -443,6 +451,8 @@ async def main():
 
     # 空结果保护：本次没扫到任何有效目标，就不写文件、不覆盖
     if not final_items:
+        with open("count.txt", "w") as f:
+            f.write("0")
         print("\n==================== 扫描结束 ====================", flush=True)
         print("[!] 本次无有效结果，跳过写文件，不覆盖已有结果。", flush=True)
         return
@@ -468,6 +478,10 @@ async def main():
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
         for line in sorted_lines:
             f.write(line + "\n")
+
+    # 写出货数量，供 TG 通知读取
+    with open("count.txt", "w") as f:
+        f.write(str(len(sorted_lines)))
 
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次出货: {len(sorted_lines)} 个", flush=True)
