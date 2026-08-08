@@ -106,7 +106,12 @@ def parse_ports(port_str):
                 start, end = part.split('-')
                 s_idx, e_idx = max(1, int(start)), min(65535, int(end))
                 if s_idx <= e_idx:
-                    ports.update(range(s_idx, e_idx + 1))
+                    span = e_idx - s_idx + 1
+                    if span > 5:
+                        # 区间大于5，随机抽5个
+                        ports.update(random.sample(range(s_idx, e_idx + 1), 5))
+                    else:
+                        ports.update(range(s_idx, e_idx + 1))
             except ValueError:
                 continue
         elif part.isdigit():
