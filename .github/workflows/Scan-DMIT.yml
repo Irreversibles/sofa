@@ -3,7 +3,7 @@ name: Scan DMIT (AS906)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 1'   # 每周一 3:00
+    - cron: '0 3 * * 1'   # 每周一 3:00 UTC（北京时间 11:00）
 
 concurrency:
   group: scan-dmit
@@ -64,7 +64,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "no change"
           else
-            git pull --rebase
             git commit -m "auto: update DMIT"
+            git pull --rebase
             git push
           fi
