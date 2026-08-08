@@ -1,0 +1,70 @@
+name: Scan DMIT (AS906)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'   # 每周一 3:00
+
+concurrency:
+  group: scan-dmit
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download GeoIP Database
+        run: |
+          for i in 1 2 3; do
+            curl -L --fail -o GeoLite2-Country.mmdb \
+              https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb && break
+            echo "retry $i..."; sleep 5
+          done
+
+      - name: Run Scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+        run: |
+          python check_cf_asn.py "906" "DMIT" "443,8443,2053,2083,2096"
+
+      - name: Push result to private repo
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+
+          shopt -s nullglob
+          for f in *.txt; do
+            if [ "$f" != "ip.txt" ]; then
+              cp "$f" result_repo/ 2>/dev/null || true
+            fi
+          done
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git pull --rebase
+            git commit -m "auto: update DMIT"
+            git push
+          fi
