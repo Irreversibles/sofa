@@ -3,7 +3,7 @@ name: Scan DMIT (AS906)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 1'   # 每周一 3:00 UTC（北京时间 11:00）
+    - cron: '0 3 * * 1'
 
 concurrency:
   group: scan-dmit
@@ -15,7 +15,6 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: write
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -49,14 +48,12 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-
           shopt -s nullglob
           for f in *.txt; do
-            if [ "$f" != "ip.txt" ]; then
+            if [ "$f" != "ip.txt" ] && [ "$f" != "count.txt" ]; then
               cp "$f" result_repo/ 2>/dev/null || true
             fi
           done
-
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
@@ -68,3 +65,16 @@ jobs:
             git pull --rebase
             git push
           fi
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ DMIT (AS906) 扫描完成%0A本次出货: ${COUNT} 个"
+          else
+            MSG="❌ DMIT (AS906) 扫描失败%0A状态: ${{ job.status }}"
+          fi
+          curl -s "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}"
