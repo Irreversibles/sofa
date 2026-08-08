@@ -438,25 +438,20 @@ async def main():
     else:
         print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，跳过。", flush=True)
 
-    # 本次新出货的 ip:port
-    new_combos = set(f"{ip}:{port}" for ip, port in final_items)
-
-    # 结果：追加去重，永久保留（读旧结果 + 新结果合并）
+    # ==================== 结果输出（每次覆盖；但空结果不写，避免洗掉旧数据） ====================
     output_filename = f"{name_label}.txt"
-    old_lines = set()
-    try:
-        with open(output_filename, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s:
-                    old_lines.add(s)
-    except FileNotFoundError:
-        pass
 
-    # 新结果行（带地区+名字）
+    # 空结果保护：本次没扫到任何有效目标，就不写文件、不覆盖
+    if not final_items:
+        print("\n==================== 扫描结束 ====================", flush=True)
+        print("[!] 本次无有效结果，跳过写文件，不覆盖已有结果。", flush=True)
+        return
+
+    # 本次结果行（内部去重，带地区+名字）
+    result_lines = set()
     for ip, port in final_items:
         country = get_country(ip)
-        old_lines.add(f"{ip}:{port}#{country} {name_label}")
+        result_lines.add(f"{ip}:{port}#{country} {name_label}")
 
     # 排序：按地区、IP、端口
     def sort_key(line):
@@ -468,15 +463,15 @@ async def main():
         except Exception:
             return ("??", ipaddress.ip_address("0.0.0.0"), 0)
 
-    sorted_lines = sorted(old_lines, key=sort_key)
+    sorted_lines = sorted(result_lines, key=sort_key)
 
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
         for line in sorted_lines:
             f.write(line + "\n")
 
     print("\n==================== 扫描结束 ====================", flush=True)
-    print(f"本次新出货: {len(new_combos)} 个 | 结果文件累计: {len(sorted_lines)} 个", flush=True)
-    print(f"[+] 结果已保存至：{output_filename}（追加去重，永久保留）", flush=True)
+    print(f"本次出货: {len(sorted_lines)} 个", flush=True)
+    print(f"[+] 结果已保存至：{output_filename}（每次覆盖，仅保留最新一批）", flush=True)
 
 
 if __name__ == "__main__":
