@@ -3,7 +3,7 @@ name: Scan xTom (AS3258)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 2'   # 每周二 3:00（和 DMIT 错开）
+    - cron: '0 3 * * 2'   # 每周二 3:00 UTC（北京时间 11:00），和 DMIT 错开
 
 concurrency:
   group: scan-xtom
@@ -64,7 +64,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "no change"
           else
+            git commit -m "auto: update xTom-jp"
             git pull --rebase
-            git commit -m "auto: update xTom"
             git push
           fi
