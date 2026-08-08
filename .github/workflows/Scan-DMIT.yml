@@ -75,6 +75,8 @@ jobs:
           else
             MSG="❌ DMIT (AS906) 扫描失败%0A状态: ${{ job.status }}"
           fi
-          curl -s "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+          echo "发送内容: ${MSG}"
+          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT_ID }} \
             -d text="${MSG}"
+          echo ""
