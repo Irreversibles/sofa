@@ -71,7 +71,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "no change"
           else
-            git pull --rebase
             git commit -m "auto: update result"
+            git pull --rebase
             git push
           fi
