@@ -59,7 +59,7 @@ jobs:
 
           shopt -s nullglob
           for f in *.txt; do
-            if [ "$f" != "ip.txt" ]; then
+            if [ "$f" != "ip.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ]; then
               cp "$f" result_repo/ 2>/dev/null || true
             fi
           done
@@ -76,15 +76,16 @@ jobs:
             git push
           fi
 
-
       - name: Notify TG
         if: always()
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          NAME=$(cat name.txt 2>/dev/null || echo "${{ github.event.inputs.name_label }}")
+          TARGET="${{ github.event.inputs.target }}"
           if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A本次出货: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: ${NAME}%0A目标: ${TARGET}%0A本次出货: ${COUNT} 个"
           else
-            MSG="❌ 扫描失败%0A状态: ${{ job.status }}"
+            MSG="❌ 扫描失败%0A服务商: ${NAME}%0A目标: ${TARGET}%0A状态: ${{ job.status }}"
           fi
           echo "发送内容: ${MSG}"
           curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
