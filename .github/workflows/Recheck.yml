@@ -1,0 +1,80 @@
+name: Recheck IPs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * */3'   # 每3天一次，UTC 6点（北京14点），可自己调
+
+concurrency:
+  group: recheck
+  cancel-in-progress: false
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+
+      - name: Pull results
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          cp result_repo/*.txt ./ 2>/dev/null || true
+
+      - name: Recheck
+        run: |
+          shopt -s nullglob
+          FILES=""
+          for f in *.txt; do
+            if [ "$f" != "requirements.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ] && [ "$f" != "ip.txt" ]; then
+              FILES="$FILES $f"
+            fi
+          done
+          echo "复验文件: $FILES"
+          if [ -n "$FILES" ]; then
+            python recheck_api.py $FILES
+          else
+            echo "没有可复验的文件"
+          fi
+
+      - name: Push back
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          cd result_repo
+          for f in ../*.txt; do
+            fn=$(basename "$f")
+            if [ "$fn" != "requirements.txt" ] && [ "$fn" != "count.txt" ] && [ "$fn" != "name.txt" ] && [ "$fn" != "ip.txt" ]; then
+              cp "$f" ./ 2>/dev/null || true
+            fi
+          done
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "recheck: 剔除失效IP + 更新落地"
+            git pull --rebase
+            git push
+          fi
+
+      - name: Notify TG
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="🔄 大号复验完成，已剔除失效IP并更新落地地区"
+          else
+            MSG="❌ 大号复验失败%0A状态: ${{ job.status }}"
+          fi
+          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}"
