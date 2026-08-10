@@ -37,6 +37,13 @@ jobs:
             echo "retry $i..."; sleep 5
           done
 
+      - name: Pull old results
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          cp result_repo/*.txt ./ 2>/dev/null || true
+
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
@@ -47,8 +54,6 @@ jobs:
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
-          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-
           shopt -s nullglob
           for f in *.txt; do
             if [ "$f" != "ip.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ]; then
@@ -73,7 +78,7 @@ jobs:
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
           if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A本次出货: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A本次新增: ${COUNT} 个"
           else
             MSG="❌ 扫描失败%0A服务商: DMIT%0A目标: AS906%0A状态: ${{ job.status }}"
           fi
