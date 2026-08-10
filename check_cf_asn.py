@@ -450,10 +450,10 @@ async def main():
     else:
         print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，跳过。", flush=True)
 
-    # ==================== 结果输出（每次覆盖；但空结果不写，避免洗掉旧数据） ====================
+    # ==================== 结果输出（追加去重 + 防覆盖保护） ====================
     output_filename = f"{name_label}.txt"
 
-    # 空结果保护：本次没扫到任何有效目标，就不写文件、不覆盖
+    # 空结果保护：本次没扫到，不写、不动旧结果
     if not final_items:
         with open("count.txt", "w") as f:
             f.write("0")
@@ -461,13 +461,28 @@ async def main():
         print("[!] 本次无有效结果，跳过写文件，不覆盖已有结果。", flush=True)
         return
 
-    # 本次结果行（内部去重，带地区+名字）
-    result_lines = set()
+    # 读旧结果
+    old_lines = set()
+    try:
+        with open(output_filename, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    old_lines.add(s)
+    except FileNotFoundError:
+        pass
+
+    old_count = len(old_lines)
+
+    # 追加新结果（去重）
+    new_count = 0
     for ip, port in final_items:
         country = get_country(ip)
-        result_lines.add(f"{ip}:{port}#{country} {name_label}")
+        line = f"{ip}:{port}#{country} {name_label}"
+        if line not in old_lines:
+            new_count += 1
+        old_lines.add(line)
 
-    # 排序：按地区、IP、端口
     def sort_key(line):
         try:
             addr = line.split("#")[0]
@@ -477,18 +492,27 @@ async def main():
         except Exception:
             return ("??", ipaddress.ip_address("0.0.0.0"), 0)
 
-    sorted_lines = sorted(result_lines, key=sort_key)
+    sorted_lines = sorted(old_lines, key=sort_key)
 
+    # 防覆盖保护：合并后远少于原有 → 疑似读取异常（如Pull失败没读到旧结果）→ 不覆盖
+    if old_count > 20 and len(sorted_lines) < old_count * 0.5:
+        print(f"[!] 合并后结果({len(sorted_lines)})远少于原有({old_count})，疑似读取异常，不覆盖！", flush=True)
+        with open("count.txt", "w") as f:
+            f.write("0")
+        return
+
+    # 写回
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
         for line in sorted_lines:
             f.write(line + "\n")
 
-    # 写出货数量，供 TG 通知读取
     with open("count.txt", "w") as f:
-        f.write(str(len(sorted_lines)))
+        f.write(str(new_count))
 
     print("\n==================== 扫描结束 ====================", flush=True)
-    print(f"本次出货: {len(sorted_lines)} 个", flush=True)
-    print(f"[+] 结果已保存至：{output_filename}（每次覆盖，仅保留最新一批）", flush=True)
+    print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
+    print(f"[+] 结果已保存（追加去重，详见私库）", flush=True)
+
+
 if __name__ == "__main__":
     asyncio.run(main())
