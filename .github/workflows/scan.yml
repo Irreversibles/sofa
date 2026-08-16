@@ -16,6 +16,10 @@ on:
         required: false
         default: '443,8443,2053,2083,2096'
 
+concurrency:
+  group: scan-manual
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -30,7 +34,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install Dependencies
         run: |
@@ -50,50 +54,74 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          cp result_repo/*.txt ./ 2>/dev/null || true
+          # 只拷结果文件，避免把私库里的 requirements.txt 覆盖到本地
+          shopt -s nullglob
+          for f in result_repo/*.txt; do
+            fn=$(basename "$f")
+            case "$fn" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+            esac
+            cp "$f" ./ 2>/dev/null || true
+          done
 
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
         run: |
-          python check_cf_asn.py "${{ github.event.inputs.target }}" "${{ github.event.inputs.name_label }}" "${{ github.event.inputs.ports }}"
+          python check_cf_asn.py "${{ inputs.target }}" "${{ inputs.name_label }}" "${{ inputs.ports }}"
 
       - name: Push result to private repo
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
-          shopt -s nullglob
-          for f in *.txt; do
-            if [ "$f" != "ip.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ]; then
-              cp "$f" result_repo/ 2>/dev/null || true
-            fi
-          done
+          # 只推本次实际产出的那个文件。
+          # 全量 cp *.txt 会把启动时拉到的旧副本一起推回去，
+          # 若期间有别的 workflow 更新过同名文件，那份成果会被静默回滚。
+          NAME=$(cat name.txt 2>/dev/null || echo "")
+          if [ -z "$NAME" ]; then
+            echo "::error::name.txt 为空，无法确定输出文件"
+            exit 1
+          fi
+          if [ ! -s "${NAME}.txt" ]; then
+            echo "${NAME}.txt 不存在或为空，本次无结果，跳过推送"
+            exit 0
+          fi
+          echo "推送 ${NAME}.txt"
+          cp "${NAME}.txt" result_repo/
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add -A
+          git add "${NAME}.txt"
           if git diff --staged --quiet; then
             echo "no change"
           else
-            git commit -m "auto: update result"
-            git pull --rebase
-            git push
+            git commit -m "auto: update ${NAME}"
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push 冲突，第 $i 次重试..."
+              git pull --rebase --autostash || exit 1
+              sleep $((RANDOM % 10 + 5))
+            done
           fi
 
       - name: Notify TG
         if: always()
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
-          NAME=$(cat name.txt 2>/dev/null || echo "${{ github.event.inputs.name_label }}")
-          TARGET="${{ github.event.inputs.target }}"
+          NAME=$(cat name.txt 2>/dev/null || echo "${{ inputs.name_label }}")
+          TARGET="${{ inputs.target }}"
           if [ "${{ job.status }}" = "success" ]; then
             MSG="✅ 扫描完成%0A服务商: ${NAME}%0A目标: ${TARGET}%0A本次新增: ${COUNT} 个"
           else
             MSG="❌ 扫描失败%0A服务商: ${NAME}%0A目标: ${TARGET}%0A状态: ${{ job.status }}"
           fi
           echo "发送内容: ${MSG}"
-          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT_ID }} \
-            -d text="${MSG}"
-          echo ""
+            -d text="${MSG}")
+          echo "$RESP"
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
