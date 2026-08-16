@@ -65,11 +65,15 @@ ASN_FETCH_TIMEOUT = 15    # 大 ASN 的 prefix 列表 JSON 很大，超时给足
 # 本机在 TLS 阶段开始前就被限速，结果暴跌。在这里登记一次，以后扫这个
 # ASN 自动套用，不必每次记参数。手动填 TCP_STAGE / TLS_CONC 可临时覆盖。
 #
-# 实测记录（AS25820 IT7NET，409,128 IP × 443）：
+# name 字段用于固定文件名：auto 模式按 API 返回的 holder 名推导，
+# 同一 ASN 可能得到不同别名而写进多个文件（IT7 / IT7NET 就是这么分家的）。
+#
+# 实测记录（AS25820，409,128 IP × 443）：
 #   预筛开(2500并发) → 探活7,341 → 一阶段71 → 有效7
 #   预筛关(TLS 200)  → 有效 516
 ASN_PROFILES = {
     "25820": {                       # IT7NET - IT7 Networks
+        "name": "IT7",
         "tcp_stage": "off",
         "tls_conc": 200,
         "note": "DDoS防护商，有扫描检测，禁用TCP预筛并降TLS并发",
@@ -438,6 +442,13 @@ def resolve_name(target_input, name_arg):
     first = target_input.strip().split(",")[0].strip()
     asn_clean = first.upper().replace("AS", "")
     if asn_clean.isdigit():
+        # 档案里登记过固定名字 → 优先用它。
+        # 否则 auto 按 API 返回的 holder 名推导，同一 ASN 可能得到不同别名，
+        # 结果被写进多个文件（IT7 / IT7NET 就是这么分家的）。
+        prof_name = ASN_PROFILES.get(asn_clean, {}).get("name")
+        if prof_name:
+            print(f"[*] AS{asn_clean} 使用档案指定名字: {prof_name}", flush=True)
+            return _safe_filename(prof_name)
         api_name = get_asn_name(asn_clean)
         simple = simplify_name(api_name)
         if simple:
