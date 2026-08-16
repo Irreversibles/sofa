@@ -97,6 +97,8 @@ except Exception:
 
 
 def get_country(ip):
+    """GeoIP 查的是 IP 注册地，不是落地国家。
+    真实落地由 recheck_api.py 用自建 API 复验时刷新。"""
     if geo_reader is None:
         return "??"
     try:
@@ -158,6 +160,12 @@ def simplify_name(full_name):
     name = name.replace(",", " ").strip()
     parts = name.split()
     return parts[0] if parts else (full_name.split()[0] if full_name.split() else "RESULT")
+
+
+def _safe_filename(name):
+    """净化成安全的文件名：ASN 注册名可能含 / 等特殊字符，会导致路径非法"""
+    cleaned = re.sub(r'[^\w.-]', '_', name).strip('._')
+    return cleaned or "RESULT"
 
 
 @lru_cache(maxsize=32)
@@ -375,15 +383,18 @@ async def gather_staged(items, make_coro, label):
 
 def resolve_name(target_input, name_arg):
     if name_arg and name_arg.lower() != "auto":
-        return name_arg
+        return _safe_filename(name_arg)
     first = target_input.strip().split(",")[0].strip()
     asn_clean = first.upper().replace("AS", "")
     if asn_clean.isdigit():
         api_name = get_asn_name(asn_clean)
         simple = simplify_name(api_name)
         if simple:
-            print(f"[*] 自动识别 AS{asn_clean} -> {simple} (原名: {api_name})", flush=True)
-            return simple
+            safe = _safe_filename(simple)
+            if safe != simple:
+                print(f"[*] 文件名净化: {simple} -> {safe}", flush=True)
+            print(f"[*] 自动识别 AS{asn_clean} -> {safe} (原名: {api_name})", flush=True)
+            return safe
         return f"AS{asn_clean}"
     return "RESULT"
 
