@@ -3,7 +3,7 @@ name: Recheck IPs
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * */3'   # 每3天一次，UTC 6点（北京14点），可自己调
+    - cron: '0 6 */3 * *'   # 每3天一次，UTC 6点（北京14点）
 
 concurrency:
   group: recheck
@@ -12,14 +12,14 @@ concurrency:
 jobs:
   recheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
       - run: pip install -r requirements.txt
 
       - name: Pull results
@@ -27,16 +27,24 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          cp result_repo/*.txt ./ 2>/dev/null || true
+          shopt -s nullglob
+          for f in result_repo/*.txt; do
+            fn=$(basename "$f")
+            case "$fn" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+            esac
+            cp "$f" ./ 2>/dev/null || true
+          done
 
       - name: Recheck
         run: |
           shopt -s nullglob
           FILES=""
           for f in *.txt; do
-            if [ "$f" != "requirements.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ] && [ "$f" != "ip.txt" ]; then
-              FILES="$FILES $f"
-            fi
+            case "$f" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+            esac
+            FILES="$FILES $f"
           done
           echo "复验文件: $FILES"
           if [ -n "$FILES" ]; then
@@ -44,18 +52,24 @@ jobs:
           else
             echo "没有可复验的文件"
           fi
+          if [ -s recheck_summary.txt ]; then
+            echo "剔除摘要："
+            cat recheck_summary.txt
+          fi
 
       - name: Push back
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
-          cd result_repo
-          for f in ../*.txt; do
-            fn=$(basename "$f")
-            if [ "$fn" != "requirements.txt" ] && [ "$fn" != "count.txt" ] && [ "$fn" != "name.txt" ] && [ "$fn" != "ip.txt" ]; then
-              cp "$f" ./ 2>/dev/null || true
-            fi
+          shopt -s nullglob
+          for f in *.txt; do
+            case "$f" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+            esac
+            cp "$f" result_repo/ 2>/dev/null || true
           done
+
+          cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add -A
@@ -63,18 +77,31 @@ jobs:
             echo "no change"
           else
             git commit -m "recheck: 剔除失效IP + 更新落地"
-            git pull --rebase
-            git push
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push 冲突，第 $i 次重试..."
+              git pull --rebase --autostash || exit 1
+              sleep $((RANDOM % 10 + 5))
+            done
           fi
 
       - name: Notify TG
         if: always()
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            MSG="🔄 大号复验完成，已剔除失效IP并更新落地地区"
+          if [ -s recheck_summary.txt ]; then
+            DETAILS=$(awk -F: '
+              { total += $2; printf "  • %s：%s 个\n", $1, $2 }
+              END { printf "合计剔除 %d 个", total }
+            ' recheck_summary.txt)
+            MSG=$(printf '🔄 大号复验完成，已剔除失效IP：\n%s' "$DETAILS")
           else
-            MSG="❌ 大号复验失败%0A状态: ${{ job.status }}"
+            if [ "${{ job.status }}" = "success" ]; then
+              MSG="🔄 大号复验完成，无失效IP需剔除"
+            else
+              MSG=$(printf '❌ 大号复验失败\n状态: %s' "${{ job.status }}")
+            fi
           fi
-          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
-            -d chat_id=${{ secrets.TG_CHAT_ID }} \
-            -d text="${MSG}"
+          curl -sS -X POST \
+            "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" \
+            --data-urlencode "text=${MSG}"
