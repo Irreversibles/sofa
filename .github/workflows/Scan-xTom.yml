@@ -42,15 +42,8 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          # 只拷结果文件，避免把私库里的 requirements.txt 之类覆盖到本地
-          shopt -s nullglob
-          for f in result_repo/*.txt; do
-            fn=$(basename "$f")
-            case "$fn" in
-              requirements.txt|ip.txt|count.txt|name.txt) continue ;;
-            esac
-            cp "$f" ./ 2>/dev/null || true
-          done
+          # 只拷自己的结果文件，避免 push 时把别人的旧副本推回去
+          cp result_repo/xTom-jp.txt ./ 2>/dev/null || true
 
       - name: Run Scan
         env:
@@ -62,18 +55,16 @@ jobs:
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
-          shopt -s nullglob
-          for f in *.txt; do
-            case "$f" in
-              requirements.txt|ip.txt|count.txt|name.txt) continue ;;
-            esac
-            cp "$f" result_repo/ 2>/dev/null || true
-          done
+          if [ ! -s xTom-jp.txt ]; then
+            echo "xTom-jp.txt 不存在或为空，本次无结果，跳过推送"
+            exit 0
+          fi
+          cp xTom-jp.txt result_repo/
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add -A
+          git add xTom-jp.txt
           if git diff --staged --quiet; then
             echo "no change"
           else
