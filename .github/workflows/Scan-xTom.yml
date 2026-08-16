@@ -22,7 +22,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install Dependencies
         run: |
@@ -42,7 +42,15 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          cp result_repo/*.txt ./ 2>/dev/null || true
+          # 只拷结果文件，避免把私库里的 requirements.txt 之类覆盖到本地
+          shopt -s nullglob
+          for f in result_repo/*.txt; do
+            fn=$(basename "$f")
+            case "$fn" in
+              requirements.txt|ip.txt|count.txt|name.txt) continue ;;
+            esac
+            cp "$f" ./ 2>/dev/null || true
+          done
 
       - name: Run Scan
         env:
@@ -56,9 +64,10 @@ jobs:
         run: |
           shopt -s nullglob
           for f in *.txt; do
-            if [ "$f" != "ip.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ]; then
-              cp "$f" result_repo/ 2>/dev/null || true
-            fi
+            case "$f" in
+              requirements.txt|ip.txt|count.txt|name.txt) continue ;;
+            esac
+            cp "$f" result_repo/ 2>/dev/null || true
           done
 
           cd result_repo
@@ -69,8 +78,12 @@ jobs:
             echo "no change"
           else
             git commit -m "auto: update xTom-jp"
-            git pull --rebase
-            git push
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push 冲突，第 $i 次重试..."
+              git pull --rebase --autostash || exit 1
+              sleep $((RANDOM % 10 + 5))
+            done
           fi
 
       - name: Notify TG
@@ -83,7 +96,11 @@ jobs:
             MSG="❌ 扫描失败%0A服务商: xTom-jp%0A目标: AS3258%0A状态: ${{ job.status }}"
           fi
           echo "发送内容: ${MSG}"
-          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT_ID }} \
-            -d text="${MSG}"
-          echo ""
+            -d text="${MSG}")
+          echo "$RESP"
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
