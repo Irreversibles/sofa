@@ -52,7 +52,7 @@ jobs:
           # 不设 TCP_STAGE / TLS_CONC：脚本内 ASN_PROFILES 会自动为 25820
           # 关闭 TCP 预筛并把 TLS 并发降到 200（该 ASN 有扫描检测，
           # 预筛会让本机在 TLS 阶段前被限速，实测 516 → 7）
-          python check_cf_asn.py "25820" "IT7" "443,8443"
+          python check_cf_asn.py "25820" "IT7" "443"
 
       - name: Push result to private repo
         env:
