@@ -8,9 +8,8 @@ import json
 import ipaddress
 import random
 import socket
-import multiprocessing
 import urllib.request
-from concurrent.futures import ProcessPoolExecutor
+from collections import Counter
 from functools import lru_cache
 
 import geoip2.database
@@ -38,6 +37,7 @@ def optimize_system_limits():
             except Exception:
                 pass
 
+
 optimize_system_limits()
 
 try:
@@ -56,12 +56,34 @@ CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
-STAGE1_CONCURRENCY = 50
-STAGE1_TIMEOUT = 2
 CF_HOST_TEST = "crypto.cloudflare.com"
-STAGE2_TIMEOUT = 1.2
-STAGE3_TIMEOUT = 1.2
-CPU_CORES = max(1, os.cpu_count() or 1)
+
+# ASN 前缀拉取：大 ASN 的 prefix 列表 JSON 很大，超时给足
+ASN_FETCH_TIMEOUT = 15
+
+# 阶段零：TCP 探活
+# 关键优化：TLS 握手成本远高于 TCP connect，先滤掉关闭端口，
+# 后面的 TLS 阶段通常只需处理原目标数的百分之几。
+TCP_CONCURRENCY = 2500
+TCP_TIMEOUT = 3.0
+# 分块大小按总量自适应：保证约 20 条进度，同时限制单批协程数
+TCP_BATCH_MIN = 50000
+TCP_BATCH_MAX = 500000
+
+# 黑洞 IP 过滤：仅在端口数足够多时有意义
+# （只扫 5 个端口时，一台正常 CF 前置主机同时开 443/2053/2083/2096 是合理的，
+#   无法据此判定异常，故自动跳过）
+BLACKHOLE_MIN_PORTS = 10
+BLACKHOLE_RATIO = 0.05
+BLACKHOLE_MIN = 20
+
+# 三阶段 TLS 校验
+TLS_CONCURRENCY = 300
+TLS_CHUNK = 20000         # 分块打印进度，避免大批量时日志长时间静默
+STAGE1_TIMEOUT = 3
+STAGE2_TIMEOUT = 2.5
+STAGE3_TIMEOUT = 2.5
+TLS_RETRY = 1             # 仅"握手未完成"重试，"明确不符"立即放弃
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -72,13 +94,6 @@ try:
     geo_reader = geoip2.database.Reader(GEOIP_DB)
 except Exception:
     geo_reader = None
-
-global_counter = None
-global_pass_counter = None
-global_lock = None
-global_total = 0
-global_step = 0
-global_printed_milestones = None
 
 
 def get_country(ip):
@@ -149,28 +164,31 @@ def simplify_name(full_name):
 def get_ips_from_asn_sync(asn_clean):
     cidrs = []
     try:
-        ripe_url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_clean}"
+        ripe_url = (f"https://stat.ripe.net/data/announced-prefixes/data.json"
+                    f"?resource=AS{asn_clean}")
         req = urllib.request.Request(ripe_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with urllib.request.urlopen(req, timeout=ASN_FETCH_TIMEOUT) as response:
             data = json.loads(response.read().decode())
             for p in data.get("data", {}).get("prefixes", []):
                 prefix = p.get("prefix")
                 if prefix and ":" not in prefix:
                     cidrs.append(prefix)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[!] RIPE 拉取失败({type(e).__name__})，尝试 bgpview...", flush=True)
     if not cidrs:
         try:
             bgp_url = f"https://api.bgpview.io/asn/{asn_clean}/prefixes"
             req = urllib.request.Request(bgp_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=8) as response:
+            with urllib.request.urlopen(req, timeout=ASN_FETCH_TIMEOUT) as response:
                 data = json.loads(response.read().decode())
                 for p in data.get("data", {}).get("ipv4_prefixes", []):
                     prefix = p.get("prefix")
                     if prefix:
                         cidrs.append(prefix)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[-] bgpview 也失败: {type(e).__name__}", flush=True)
+    if cidrs:
+        print(f"[*] AS{asn_clean}: 拿到 {len(cidrs)} 个 IPv4 前缀", flush=True)
     ip_list = []
     for cidr in cidrs:
         try:
@@ -226,7 +244,12 @@ async def parse_targets_async(input_str):
         if asn_clean.isdigit():
             ips = await loop.run_in_executor(None, get_ips_from_asn_sync, asn_clean)
             all_ips.extend(ips)
+    before = len(all_ips)
     unique_ips = list(dict.fromkeys(all_ips))
+    if len(unique_ips) < before:
+        print(f"[*] IP 去重: {before:,} → {len(unique_ips):,}"
+              f"（BGP 前缀重叠，省掉 {before - len(unique_ips):,} 个重复探测）",
+              flush=True)
     random.shuffle(unique_ips)
     return unique_ips
 
@@ -246,7 +269,27 @@ def match_domain_in_cert(sni_domain, cert_str):
     return False
 
 
+async def tcp_alive(ip, port, sem):
+    """纯 TCP 握手，成本约为 TLS 的十分之一"""
+    async with sem:
+        writer = None
+        try:
+            conn = asyncio.open_connection(ip, port)
+            reader, writer = await asyncio.wait_for(conn, timeout=TCP_TIMEOUT)
+            return (ip, port)
+        except Exception:
+            return None
+        finally:
+            if writer:
+                writer.close()
+                try:
+                    writer.transport.abort()
+                except Exception:
+                    pass
+
+
 async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
+    """True=证书匹配 / False=明确不匹配 / None=握手未完成（可重试）"""
     async with sem:
         writer = None
         try:
@@ -257,14 +300,14 @@ async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             ssl_obj = writer.get_extra_info('ssl_object')
             if not ssl_obj:
-                return False
+                return None
             der_cert = ssl_obj.getpeercert(binary_form=True)
             if not der_cert:
-                return False
+                return None
             cert_str = der_cert.decode('latin1', errors='ignore').lower()
             return match_domain_in_cert(sni, cert_str)
         except Exception:
-            return False
+            return None
         finally:
             if writer:
                 writer.close()
@@ -275,6 +318,7 @@ async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
 
 
 async def check_http_async(ip, port, host, timeout_val, sem):
+    """True=拿到301/302 / False=拿到响应但不符 / None=没拿到响应（可重试）"""
     async with sem:
         writer = None
         try:
@@ -283,16 +327,18 @@ async def check_http_async(ip, port, host, timeout_val, sem):
             sock = writer.get_extra_info('socket')
             if sock:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            req = f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+            req = (f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+                   f"Connection: close\r\n\r\n")
             writer.write(req.encode('latin1'))
             await writer.drain()
             data = await asyncio.wait_for(reader.read(512), timeout=timeout_val)
             if not data:
-                return False
-            resp_str = data.decode('latin1', errors='ignore').lower()
-            return ("http/1.1 301" in resp_str or "http/1.1 302" in resp_str) and ("location:" in resp_str)
+                return None
+            resp = data.decode('latin1', errors='ignore').lower()
+            return (("http/1.1 301" in resp or "http/1.1 302" in resp)
+                    and ("location:" in resp))
         except Exception:
-            return False
+            return None
         finally:
             if writer:
                 writer.close()
@@ -302,44 +348,29 @@ async def check_http_async(ip, port, host, timeout_val, sem):
                     pass
 
 
-def _init_process_worker(counter, pass_counter, lock, total, printed_array):
-    global global_counter, global_pass_counter, global_lock, global_total, global_step, global_printed_milestones
-    global_counter = counter
-    global_pass_counter = pass_counter
-    global_lock = lock
-    global_total = total
-    global_step = max(1, total // 10)
-    global_printed_milestones = printed_array
+async def retry_check(fn, ip, port, arg, timeout_val, sem):
+    """三态重试：None（握手未完成）才重试，False（明确不符）立即返回"""
+    for attempt in range(TLS_RETRY + 1):
+        r = await fn(ip, port, arg, timeout_val, sem)
+        if r is not None:
+            return r
+        if attempt < TLS_RETRY:
+            await asyncio.sleep(0.5 + random.random())
+    return False
 
 
-def _process_worker_stage1(targets_chunk):
-    if UVLOOP_ENABLED:
-        uvloop.install()
-
-    async def _run():
-        sem = asyncio.Semaphore(STAGE1_CONCURRENCY)
-
-        async def worker(ip, port):
-            res = await check_tls_sni_async(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem)
-            with global_lock:
-                global_counter.value += 1
-                if res:
-                    global_pass_counter.value += 1
-                curr = global_counter.value
-                passed = global_pass_counter.value
-                milestone_idx = curr // global_step
-                if 1 <= milestone_idx <= 10:
-                    if global_printed_milestones[milestone_idx - 1] == 0:
-                        global_printed_milestones[milestone_idx - 1] = 1
-                        pct = min(100, milestone_idx * 10)
-                        print(f"  [第一阶段进度] {pct}% ({curr:,}/{global_total:,}) | 已通过: {passed:,}", flush=True)
-            return res
-
-        tasks = [worker(ip, port) for ip, port in targets_chunk]
-        results = await asyncio.gather(*tasks)
-        return [targets_chunk[i] for i, ok in enumerate(results) if ok]
-
-    return asyncio.run(_run())
+async def gather_staged(items, make_coro, label):
+    """分块执行 + 进度打印，避免大批量时日志长时间静默"""
+    total = len(items)
+    results = []
+    for i in range(0, total, TLS_CHUNK):
+        part = items[i:i + TLS_CHUNK]
+        res = await asyncio.gather(*[make_coro(ip, p) for ip, p in part])
+        results.extend(res)
+        if total > TLS_CHUNK:
+            print(f"  [{label}] {min(i + TLS_CHUNK, total):,}/{total:,} | "
+                  f"通过: {sum(1 for x in results if x):,}", flush=True)
+    return results
 
 
 def resolve_name(target_input, name_arg):
@@ -363,12 +394,9 @@ async def main():
     ports_input = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_PORTS
 
     name_label = resolve_name(target_input, name_arg)
-
-    # 把识别后的真实名字写出来，供 TG 通知读取
     with open("name.txt", "w") as f:
         f.write(name_label)
 
-    # 选端口（按填写的来）
     target_ports = pick_ports(ports_input)
     print(f"[*] 本次使用端口({len(target_ports)}个): {target_ports}", flush=True)
 
@@ -380,80 +408,118 @@ async def main():
         print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
         return
 
-    # 生成所有 ip:port 组合
-    targets = []
+    total = len(all_ips) * len(target_ports)
+    tcp_batch = min(TCP_BATCH_MAX, max(TCP_BATCH_MIN, total // 20))
+
+    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 单进程异步 | 名字={name_label}", flush=True)
+    print(f"[*] {len(all_ips):,} IP × {len(target_ports)} 端口，"
+          f"共 {total:,} 个目标", flush=True)
+    print(f"[*] TCP 阶段预估约 {total / 1100 / 60:.0f} 分钟"
+          f"（分 {(total + tcp_batch - 1) // tcp_batch} 批，每批 {tcp_batch:,}）", flush=True)
+
+    # ==================== 阶段零：TCP 探活 ====================
+    print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s...",
+          flush=True)
+    tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
+    open_ports = []
+    batch = []
+    done = 0
+
+    async def flush_batch(b):
+        nonlocal done
+        res = await asyncio.gather(*[tcp_alive(ip, p, tcp_sem) for ip, p in b])
+        open_ports.extend([r for r in res if r])
+        done += len(b)
+        print(f"  [探活] {done:,}/{total:,} | 开放: {len(open_ports):,}", flush=True)
+
     for ip in all_ips:
         for port in target_ports:
-            targets.append((ip, port))
+            batch.append((ip, port))
+            if len(batch) >= tcp_batch:
+                await flush_batch(batch)
+                batch = []
+    if batch:
+        await flush_batch(batch)
 
-    total_targets_count = len(targets)
-    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 进程={CPU_CORES} | 名字={name_label}", flush=True)
-    print(f"[*] {len(all_ips)} IP × {len(target_ports)} 端口，共 {total_targets_count:,} 个目标。", flush=True)
-    if total_targets_count == 0:
+    print(f"[+] 探活完成！开放: {len(open_ports):,} 个"
+          f"（过滤掉 {total - len(open_ports):,} 个关闭端口，"
+          f"TLS 阶段工作量降至 {len(open_ports) / max(total, 1) * 100:.2f}%）", flush=True)
+
+    if not open_ports:
         with open("count.txt", "w") as f:
             f.write("0")
-        print("[-] 本次无目标。", flush=True)
+        print("[-] 无开放端口。", flush=True)
         return
 
-    # 第一阶段
-    print(f"\n[1/3 第一阶段 TLS 探测] 多进程并发中...", flush=True)
-    num_chunks = CPU_CORES * 4
-    chunk_size = max(1, total_targets_count // num_chunks)
-    chunks = [targets[i:i + chunk_size] for i in range(0, total_targets_count, chunk_size)]
+    # 黑洞 IP 过滤（端口数太少时无法判定，自动跳过）
+    if len(target_ports) > BLACKHOLE_MIN_PORTS:
+        threshold = max(BLACKHOLE_MIN, int(len(target_ports) * BLACKHOLE_RATIO))
+        ip_cnt = Counter(ip for ip, _ in open_ports)
+        bad_ips = {ip for ip, c in ip_cnt.items() if c >= threshold}
+        if bad_ips:
+            before = len(open_ports)
+            open_ports = [(ip, p) for ip, p in open_ports if ip not in bad_ips]
+            print(f"[*] 剔除疑似黑洞 IP {len(bad_ips)} 个（单IP开放 ≥ {threshold}），"
+                  f"开放数 {before:,} → {len(open_ports):,}", flush=True)
+            for ip in sorted(bad_ips, key=lambda x: -ip_cnt[x])[:10]:
+                print(f"    x {ip} (开放 {ip_cnt[ip]} 个)", flush=True)
+            if len(bad_ips) > 10:
+                print(f"    ... 另有 {len(bad_ips) - 10} 个", flush=True)
+    else:
+        print(f"[*] 端口数 {len(target_ports)} ≤ {BLACKHOLE_MIN_PORTS}，"
+              f"跳过黑洞IP过滤", flush=True)
 
-    manager = multiprocessing.Manager()
-    counter = manager.Value('i', 0)
-    pass_counter = manager.Value('i', 0)
-    lock = manager.Lock()
-    printed_array = manager.Array('i', [0] * 10)
+    tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
 
-    pass_1 = []
-    loop = asyncio.get_running_loop()
-    with ProcessPoolExecutor(
-        max_workers=CPU_CORES,
-        initializer=_init_process_worker,
-        initargs=(counter, pass_counter, lock, total_targets_count, printed_array)
-    ) as executor:
-        futures = [loop.run_in_executor(executor, _process_worker_stage1, chunk) for chunk in chunks]
-        results = await asyncio.gather(*futures)
-        for res in results:
-            pass_1.extend(res)
-    print(f"[+] 第一阶段完成！保留: {len(pass_1)} 个\n", flush=True)
+    # ==================== 第一阶段：CF 证书 ====================
+    print(f"\n[1/3 第一阶段 TLS 探测] 校验 {len(open_ports):,} 个"
+          f"（握手失败重试 {TLS_RETRY} 次）...", flush=True)
+    r1 = await gather_staged(
+        open_ports,
+        lambda ip, p: retry_check(check_tls_sni_async, ip, p,
+                                  CF_SNI_1, STAGE1_TIMEOUT, tls_sem),
+        "第一阶段")
+    pass_1 = [open_ports[i] for i, ok in enumerate(r1) if ok]
+    print(f"[+] 第一阶段完成！保留: {len(pass_1):,} 个\n", flush=True)
     if not pass_1:
         with open("count.txt", "w") as f:
             f.write("0")
         print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
-    # 第二阶段 crypto 301
-    sem = asyncio.Semaphore(STAGE1_CONCURRENCY * CPU_CORES)
-    print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1)} 个候选...", flush=True)
-    tasks2 = [check_http_async(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem) for ip, port in pass_1]
-    res2 = await asyncio.gather(*tasks2)
-    pass_2 = [pass_1[i] for i, ok in enumerate(res2) if ok]
-    print(f"[+] 第二阶段完成！保留: {len(pass_2)} 个\n", flush=True)
+    # ==================== 第二阶段：crypto 301 ====================
+    print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1):,} 个候选...", flush=True)
+    r2 = await gather_staged(
+        pass_1,
+        lambda ip, p: retry_check(check_http_async, ip, p,
+                                  CF_HOST_TEST, STAGE2_TIMEOUT, tls_sem),
+        "第二阶段")
+    pass_2 = [pass_1[i] for i, ok in enumerate(r2) if ok]
+    print(f"[+] 第二阶段完成！保留: {len(pass_2):,} 个\n", flush=True)
     if not pass_2:
         with open("count.txt", "w") as f:
             f.write("0")
         print("[-] 无有效目标通过第二阶段。", flush=True)
         return
 
-    # 第三阶段 你的域名
+    # ==================== 第三阶段：自定义域名 ====================
     final_items = pass_2
     if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
         domain = CUSTOM_CF_DOMAIN.strip()
-        print(f"[3/3 第三阶段自定义域名校验] 校验 {len(pass_2)} 个...", flush=True)
-        tasks3 = [check_tls_sni_async(ip, port, domain, STAGE3_TIMEOUT, sem) for ip, port in pass_2]
-        res3 = await asyncio.gather(*tasks3)
-        final_items = [pass_2[i] for i, ok in enumerate(res3) if ok]
-        print(f"[+] 第三阶段完成！有效目标: {len(final_items)} 个", flush=True)
+        print(f"[3/3 第三阶段自定义域名校验] 校验 {len(pass_2):,} 个...", flush=True)
+        r3 = await gather_staged(
+            pass_2,
+            lambda ip, p: retry_check(check_tls_sni_async, ip, p,
+                                      domain, STAGE3_TIMEOUT, tls_sem),
+            "第三阶段")
+        final_items = [pass_2[i] for i, ok in enumerate(r3) if ok]
+        print(f"[+] 第三阶段完成！有效目标: {len(final_items):,} 个", flush=True)
     else:
         print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，跳过。", flush=True)
 
     # ==================== 结果输出（追加去重 + 防覆盖保护） ====================
     output_filename = f"{name_label}.txt"
 
-    # 空结果保护：本次没扫到，不写、不动旧结果
     if not final_items:
         with open("count.txt", "w") as f:
             f.write("0")
@@ -461,7 +527,6 @@ async def main():
         print("[!] 本次无有效结果，跳过写文件，不覆盖已有结果。", flush=True)
         return
 
-    # 读旧结果
     old_lines = set()
     try:
         with open(output_filename, "r", encoding="utf-8") as f:
@@ -474,7 +539,6 @@ async def main():
 
     old_count = len(old_lines)
 
-    # 追加新结果（去重）
     new_count = 0
     for ip, port in final_items:
         country = get_country(ip)
@@ -494,14 +558,13 @@ async def main():
 
     sorted_lines = sorted(old_lines, key=sort_key)
 
-    # 防覆盖保护：合并后远少于原有 → 疑似读取异常（如Pull失败没读到旧结果）→ 不覆盖
     if old_count > 20 and len(sorted_lines) < old_count * 0.5:
-        print(f"[!] 合并后结果({len(sorted_lines)})远少于原有({old_count})，疑似读取异常，不覆盖！", flush=True)
+        print(f"[!] 合并后结果({len(sorted_lines)})远少于原有({old_count})，"
+              f"疑似读取异常，不覆盖！", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
         return
 
-    # 写回
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
         for line in sorted_lines:
             f.write(line + "\n")
