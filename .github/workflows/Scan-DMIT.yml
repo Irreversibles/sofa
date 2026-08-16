@@ -42,15 +42,9 @@ jobs:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          # 只拷结果文件，避免把私库里的 requirements.txt 之类覆盖到本地
-          shopt -s nullglob
-          for f in result_repo/*.txt; do
-            fn=$(basename "$f")
-            case "$fn" in
-              requirements.txt|ip.txt|count.txt|name.txt) continue ;;
-            esac
-            cp "$f" ./ 2>/dev/null || true
-          done
+          # 只拷自己的结果文件：本轮只会更新 DMIT.txt，
+          # 拉别的文件下来毫无用处，反而可能在 push 时把它们的旧副本推回去
+          cp result_repo/DMIT.txt ./ 2>/dev/null || true
 
       - name: Run Scan
         env:
@@ -62,18 +56,16 @@ jobs:
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
-          shopt -s nullglob
-          for f in *.txt; do
-            case "$f" in
-              requirements.txt|ip.txt|count.txt|name.txt) continue ;;
-            esac
-            cp "$f" result_repo/ 2>/dev/null || true
-          done
+          if [ ! -s DMIT.txt ]; then
+            echo "DMIT.txt 不存在或为空，本次无结果，跳过推送"
+            exit 0
+          fi
+          cp DMIT.txt result_repo/
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add -A
+          git add DMIT.txt
           if git diff --staged --quiet; then
             echo "no change"
           else
