@@ -63,20 +63,26 @@ ASN_FETCH_TIMEOUT = 15    # 大 ASN 的 prefix 列表 JSON 很大，超时给足
 # ==================== 按 ASN 的策略档案 ====================
 # 某些服务商（尤其 DDoS 防护类）对高并发 SYN 有扫描检测：TCP 预筛会让
 # 本机在 TLS 阶段开始前就被限速，结果暴跌。在这里登记一次，以后扫这个
-# ASN 自动套用，不必每次记参数。手动填 TCP_STAGE / TLS_CONC 可临时覆盖。
+# ASN 自动套用，不必每次记参数。环境变量可临时覆盖。
 #
-# name 字段用于固定文件名：auto 模式按 API 返回的 holder 名推导，
-# 同一 ASN 可能得到不同别名而写进多个文件（IT7 / IT7NET 就是这么分家的）。
+# 可用字段：name / tcp_stage / tcp_conc / tls_conc / tls_retry / stage1_timeout
+# name 用于固定文件名 —— auto 模式按 API 返回的 holder 名推导，同一 ASN
+# 可能得到不同别名而写进多个文件（IT7 / IT7NET 就是这么分家的）。
 #
 # 实测记录（AS25820，409,128 IP × 443）：
-#   预筛开(2500并发) → 探活7,341 → 一阶段71 → 有效7
-#   预筛关(TLS 200)  → 有效 516
+#   预筛开(2500并发)              → 探活7,341 → 一阶段71  → 有效7
+#   预筛关(TLS 200, retry1, 3s)   → 40,000个跑了33分钟，全程需337分钟，会超时
+#   预筛关(TLS 200, retry0, 2s)   → 约51-68分钟（与原版一致），一阶段外推约5,600
+# 关重试的依据：40万个IP里绝大多数443关闭、瞬间回RST，而 retry 的退避
+# sleep 会把每个RST从0.2s拖到1.4s，这批目标占了全程绝大部分时间。
 ASN_PROFILES = {
     "25820": {                       # IT7NET - IT7 Networks
         "name": "IT7",
         "tcp_stage": "off",
         "tls_conc": 200,
-        "note": "DDoS防护商，有扫描检测，禁用TCP预筛并降TLS并发",
+        "tls_retry": 0,
+        "stage1_timeout": 2,
+        "note": "DDoS防护商，有扫描检测；禁用TCP预筛，并用原版参数(200并发/2s/无重试)保证跑得完",
     },
 }
 
@@ -116,7 +122,8 @@ except Exception:
 
 def apply_asn_profile(asn_clean):
     """按 ASN 套用策略档案。环境变量为 auto/空时交给档案，显式指定则覆盖档案。"""
-    global TCP_STAGE_ENABLED, TCP_CONCURRENCY, TLS_CONCURRENCY
+    global TCP_STAGE_ENABLED, TCP_CONCURRENCY
+    global TLS_CONCURRENCY, TLS_RETRY, STAGE1_TIMEOUT
 
     prof = ASN_PROFILES.get(asn_clean, {})
     if prof:
@@ -142,8 +149,22 @@ def apply_asn_profile(asn_clean):
     elif "tls_conc" in prof:
         TLS_CONCURRENCY = int(prof["tls_conc"])
 
+    env_retry = os.getenv("TLS_RETRY", "auto").strip().lower()
+    if env_retry.isdigit():
+        TLS_RETRY = int(env_retry)
+    elif "tls_retry" in prof:
+        TLS_RETRY = int(prof["tls_retry"])
+
+    env_s1 = os.getenv("STAGE1_TIMEOUT", "auto").strip().lower()
+    try:
+        STAGE1_TIMEOUT = float(env_s1)
+    except ValueError:
+        if "stage1_timeout" in prof:
+            STAGE1_TIMEOUT = float(prof["stage1_timeout"])
+
     print(f"[*] 策略: TCP预筛={'启用' if TCP_STAGE_ENABLED else '禁用'}（{src}） | "
-          f"并发 TCP={TCP_CONCURRENCY} TLS={TLS_CONCURRENCY}", flush=True)
+          f"并发 TCP={TCP_CONCURRENCY} TLS={TLS_CONCURRENCY} | "
+          f"TLS重试={TLS_RETRY} 一阶段超时={STAGE1_TIMEOUT}s", flush=True)
 
 
 def get_country(ip):
@@ -412,7 +433,12 @@ async def check_http_async(ip, port, host, timeout_val, sem):
 
 
 async def retry_check(fn, ip, port, arg, timeout_val, sem):
-    """三态重试：None（握手未完成）才重试，False（明确不符）立即返回"""
+    """三态重试：None（握手未完成）才重试，False（明确不符）立即返回。
+
+    TLS_RETRY=0 时退化为单次探测（原版行为）。注意：本函数把 RST 也算作
+    可重试的 None，而退避 sleep 对 RST 是纯浪费 —— 大 ASN 上绝大多数
+    目标就是 RST，所以那类 ASN 应在档案里设 tls_retry=0。
+    """
     for attempt in range(TLS_RETRY + 1):
         r = await fn(ip, port, arg, timeout_val, sem)
         if r is not None:
@@ -557,15 +583,16 @@ async def main():
         open_ports = [(ip, p) for p in target_ports for ip in all_ips]
         print(f"\n[0/3 阶段零] TCP预筛已禁用，"
               f"直接对全部 {len(open_ports):,} 个目标做 TLS", flush=True)
-        print(f"[*] TLS 第一阶段预估约 "
-              f"{len(open_ports) / (TLS_CONCURRENCY / STAGE1_TIMEOUT) / 60:.0f} 分钟",
-              flush=True)
+        print(f"[*] TLS 第一阶段预估最坏约 "
+              f"{len(open_ports) / (TLS_CONCURRENCY / STAGE1_TIMEOUT) / 60:.0f} 分钟"
+              f"（按每个目标都吃满超时算，实际通常快得多）", flush=True)
 
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
 
     # ==================== 第一阶段：CF 证书 ====================
     print(f"\n[1/3 第一阶段 TLS 探测] 校验 {len(open_ports):,} 个"
-          f"（并发={TLS_CONCURRENCY} 握手失败重试 {TLS_RETRY} 次）...", flush=True)
+          f"（并发={TLS_CONCURRENCY} 超时={STAGE1_TIMEOUT}s "
+          f"重试={TLS_RETRY}）...", flush=True)
     r1 = await gather_staged(
         open_ports,
         lambda ip, p: retry_check(check_tls_sni_async, ip, p,
