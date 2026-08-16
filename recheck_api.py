@@ -8,8 +8,11 @@ import aiohttp
 
 # ==================== 配置 ====================
 CHECK_API = "https://check.tigaa.ccwu.cc/check"   # ← 你自建的检测 API
-CONCURRENCY = 20              # 从 10 提到 20，抵消重试带来的耗时
-TIMEOUT = 30                  # 从 20 提到 30，非标端口握手慢
+# 并发 50：check_one 在 sem 内部重试，sleep 期间不释放槽位，
+# API 完全无响应时单条最坏占用约 96 秒（30+2+30+4+30）。
+# 并发 20 折算每分钟仅 12.5 条，120 分钟上限约 1500 条；50 可支撑约 3750 条。
+CONCURRENCY = 50
+TIMEOUT = 30                  # 非标端口握手慢，20 偏紧
 API_RETRY = 2                 # API 异常时的重试次数
 MIN_SURVIVE_RATIO = 0.15      # 存活率过低不覆盖（防API抽风误删）
 API_ERROR_ABORT_RATIO = 0.3   # API异常占比超过此值 → 判定故障，整个文件不动
