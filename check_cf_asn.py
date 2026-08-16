@@ -58,15 +58,29 @@ GEOIP_DB = "GeoLite2-Country.mmdb"
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
 
-# ASN 前缀拉取：大 ASN 的 prefix 列表 JSON 很大，超时给足
-ASN_FETCH_TIMEOUT = 15
+ASN_FETCH_TIMEOUT = 15    # 大 ASN 的 prefix 列表 JSON 很大，超时给足
 
-# 阶段零：TCP 探活
-# 关键优化：TLS 握手成本远高于 TCP connect，先滤掉关闭端口，
-# 后面的 TLS 阶段通常只需处理原目标数的百分之几。
+# ==================== 按 ASN 的策略档案 ====================
+# 某些服务商（尤其 DDoS 防护类）对高并发 SYN 有扫描检测：TCP 预筛会让
+# 本机在 TLS 阶段开始前就被限速，结果暴跌。在这里登记一次，以后扫这个
+# ASN 自动套用，不必每次记参数。手动填 TCP_STAGE / TLS_CONC 可临时覆盖。
+#
+# 实测记录（AS25820 IT7NET，409,128 IP × 443）：
+#   预筛开(2500并发) → 探活7,341 → 一阶段71 → 有效7
+#   预筛关(TLS 200)  → 有效 516
+ASN_PROFILES = {
+    "25820": {                       # IT7NET - IT7 Networks
+        "tcp_stage": "off",
+        "tls_conc": 200,
+        "note": "DDoS防护商，有扫描检测，禁用TCP预筛并降TLS并发",
+    },
+}
+
+# 阶段零：TCP 探活（默认值，可被策略档案或环境变量覆盖）
+TCP_STAGE_ENABLED = True
 TCP_CONCURRENCY = 2500
-TCP_TIMEOUT = 3.0
-# 分块大小按总量自适应：保证约 20 条进度，同时限制单批协程数
+TCP_TIMEOUT = float(os.getenv("TCP_TIMEOUT", "3.0"))
+TCP_RETRY = int(os.getenv("TCP_RETRY", "1"))    # 带退避，专治被限速丢的 SYN
 TCP_BATCH_MIN = 50000
 TCP_BATCH_MAX = 500000
 
@@ -94,6 +108,38 @@ try:
     geo_reader = geoip2.database.Reader(GEOIP_DB)
 except Exception:
     geo_reader = None
+
+
+def apply_asn_profile(asn_clean):
+    """按 ASN 套用策略档案。环境变量为 auto/空时交给档案，显式指定则覆盖档案。"""
+    global TCP_STAGE_ENABLED, TCP_CONCURRENCY, TLS_CONCURRENCY
+
+    prof = ASN_PROFILES.get(asn_clean, {})
+    if prof:
+        print(f"[*] 命中 AS{asn_clean} 策略档案: {prof.get('note', '')}", flush=True)
+
+    env_stage = os.getenv("TCP_STAGE", "auto").strip().lower()
+    if env_stage in ("", "auto"):
+        stage = prof.get("tcp_stage", "on")
+        src = "策略档案" if "tcp_stage" in prof else "默认"
+    else:
+        stage, src = env_stage, "手动指定"
+    TCP_STAGE_ENABLED = (stage != "off")
+
+    env_tcp = os.getenv("TCP_CONC", "auto").strip().lower()
+    if env_tcp.isdigit():
+        TCP_CONCURRENCY = int(env_tcp)
+    elif "tcp_conc" in prof:
+        TCP_CONCURRENCY = int(prof["tcp_conc"])
+
+    env_tls = os.getenv("TLS_CONC", "auto").strip().lower()
+    if env_tls.isdigit():
+        TLS_CONCURRENCY = int(env_tls)
+    elif "tls_conc" in prof:
+        TLS_CONCURRENCY = int(prof["tls_conc"])
+
+    print(f"[*] 策略: TCP预筛={'启用' if TCP_STAGE_ENABLED else '禁用'}（{src}） | "
+          f"并发 TCP={TCP_CONCURRENCY} TLS={TLS_CONCURRENCY}", flush=True)
 
 
 def get_country(ip):
@@ -278,22 +324,27 @@ def match_domain_in_cert(sni_domain, cert_str):
 
 
 async def tcp_alive(ip, port, sem):
-    """纯 TCP 握手，成本约为 TLS 的十分之一"""
+    """纯 TCP 握手。失败时带退避重试 —— 被限速丢的 SYN 立刻重连仍会失败"""
     async with sem:
-        writer = None
-        try:
-            conn = asyncio.open_connection(ip, port)
-            reader, writer = await asyncio.wait_for(conn, timeout=TCP_TIMEOUT)
-            return (ip, port)
-        except Exception:
-            return None
-        finally:
-            if writer:
-                writer.close()
-                try:
-                    writer.transport.abort()
-                except Exception:
-                    pass
+        for attempt in range(TCP_RETRY + 1):
+            writer = None
+            try:
+                conn = asyncio.open_connection(ip, port)
+                reader, writer = await asyncio.wait_for(conn, timeout=TCP_TIMEOUT)
+                return (ip, port)
+            except Exception:
+                if attempt < TCP_RETRY:
+                    await asyncio.sleep(0.5 + random.random())
+                    continue
+                return None
+            finally:
+                if writer:
+                    writer.close()
+                    try:
+                        writer.transport.abort()
+                    except Exception:
+                        pass
+        return None
 
 
 async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
@@ -408,6 +459,10 @@ async def main():
     with open("name.txt", "w") as f:
         f.write(name_label)
 
+    # 按第一个 ASN 套用策略档案（多 ASN 混扫时以第一个为准）
+    first_target = target_input.strip().split(",")[0].strip()
+    apply_asn_profile(first_target.upper().replace("AS", ""))
+
     target_ports = pick_ports(ports_input)
     print(f"[*] 本次使用端口({len(target_ports)}个): {target_ports}", flush=True)
 
@@ -425,66 +480,81 @@ async def main():
     print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | 单进程异步 | 名字={name_label}", flush=True)
     print(f"[*] {len(all_ips):,} IP × {len(target_ports)} 端口，"
           f"共 {total:,} 个目标", flush=True)
-    print(f"[*] TCP 阶段预估约 {total / 1100 / 60:.0f} 分钟"
-          f"（分 {(total + tcp_batch - 1) // tcp_batch} 批，每批 {tcp_batch:,}）", flush=True)
 
     # ==================== 阶段零：TCP 探活 ====================
-    print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s...",
-          flush=True)
-    tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
-    open_ports = []
-    batch = []
-    done = 0
+    if TCP_STAGE_ENABLED:
+        print(f"[*] TCP 阶段预估约 {total / (TCP_CONCURRENCY / TCP_TIMEOUT) / 60:.0f} 分钟"
+              f"（分 {(total + tcp_batch - 1) // tcp_batch} 批，每批 {tcp_batch:,}）",
+              flush=True)
+        print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} "
+              f"超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
+        tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
+        open_ports = []
+        batch = []
+        done = 0
 
-    async def flush_batch(b):
-        nonlocal done
-        res = await asyncio.gather(*[tcp_alive(ip, p, tcp_sem) for ip, p in b])
-        open_ports.extend([r for r in res if r])
-        done += len(b)
-        print(f"  [探活] {done:,}/{total:,} | 开放: {len(open_ports):,}", flush=True)
+        async def flush_batch(b):
+            nonlocal done
+            res = await asyncio.gather(*[tcp_alive(ip, p, tcp_sem) for ip, p in b])
+            open_ports.extend([r for r in res if r])
+            done += len(b)
+            print(f"  [探活] {done:,}/{total:,} | 开放: {len(open_ports):,}", flush=True)
 
-    for ip in all_ips:
+        # 端口优先：让同一批并发落在不同 IP 上。
+        # IP 优先（ip1:443, ip1:8443, ip2:443...）会使 2500 并发只覆盖约
+        # 1250 个 IP、每个同时挨 2 个 SYN，更容易触发目标侧扫描检测。
         for port in target_ports:
-            batch.append((ip, port))
-            if len(batch) >= tcp_batch:
-                await flush_batch(batch)
-                batch = []
-    if batch:
-        await flush_batch(batch)
+            for ip in all_ips:
+                batch.append((ip, port))
+                if len(batch) >= tcp_batch:
+                    await flush_batch(batch)
+                    batch = []
+        if batch:
+            await flush_batch(batch)
 
-    print(f"[+] 探活完成！开放: {len(open_ports):,} 个"
-          f"（过滤掉 {total - len(open_ports):,} 个关闭端口，"
-          f"TLS 阶段工作量降至 {len(open_ports) / max(total, 1) * 100:.2f}%）", flush=True)
+        print(f"[+] 探活完成！开放: {len(open_ports):,} 个"
+              f"（过滤掉 {total - len(open_ports):,} 个关闭端口，"
+              f"TLS 阶段工作量降至 {len(open_ports) / max(total, 1) * 100:.2f}%）",
+              flush=True)
 
-    if not open_ports:
-        with open("count.txt", "w") as f:
-            f.write("0")
-        print("[-] 无开放端口。", flush=True)
-        return
+        if not open_ports:
+            with open("count.txt", "w") as f:
+                f.write("0")
+            print("[-] 无开放端口。", flush=True)
+            return
 
-    # 黑洞 IP 过滤（端口数太少时无法判定，自动跳过）
-    if len(target_ports) > BLACKHOLE_MIN_PORTS:
-        threshold = max(BLACKHOLE_MIN, int(len(target_ports) * BLACKHOLE_RATIO))
-        ip_cnt = Counter(ip for ip, _ in open_ports)
-        bad_ips = {ip for ip, c in ip_cnt.items() if c >= threshold}
-        if bad_ips:
-            before = len(open_ports)
-            open_ports = [(ip, p) for ip, p in open_ports if ip not in bad_ips]
-            print(f"[*] 剔除疑似黑洞 IP {len(bad_ips)} 个（单IP开放 ≥ {threshold}），"
-                  f"开放数 {before:,} → {len(open_ports):,}", flush=True)
-            for ip in sorted(bad_ips, key=lambda x: -ip_cnt[x])[:10]:
-                print(f"    x {ip} (开放 {ip_cnt[ip]} 个)", flush=True)
-            if len(bad_ips) > 10:
-                print(f"    ... 另有 {len(bad_ips) - 10} 个", flush=True)
+        # 黑洞 IP 过滤（端口数太少时无法判定，自动跳过）
+        if len(target_ports) > BLACKHOLE_MIN_PORTS:
+            threshold = max(BLACKHOLE_MIN, int(len(target_ports) * BLACKHOLE_RATIO))
+            ip_cnt = Counter(ip for ip, _ in open_ports)
+            bad_ips = {ip for ip, c in ip_cnt.items() if c >= threshold}
+            if bad_ips:
+                before = len(open_ports)
+                open_ports = [(ip, p) for ip, p in open_ports if ip not in bad_ips]
+                print(f"[*] 剔除疑似黑洞 IP {len(bad_ips)} 个（单IP开放 ≥ {threshold}），"
+                      f"开放数 {before:,} → {len(open_ports):,}", flush=True)
+                for ip in sorted(bad_ips, key=lambda x: -ip_cnt[x])[:10]:
+                    print(f"    x {ip} (开放 {ip_cnt[ip]} 个)", flush=True)
+                if len(bad_ips) > 10:
+                    print(f"    ... 另有 {len(bad_ips) - 10} 个", flush=True)
+        else:
+            print(f"[*] 端口数 {len(target_ports)} ≤ {BLACKHOLE_MIN_PORTS}，"
+                  f"跳过黑洞IP过滤", flush=True)
     else:
-        print(f"[*] 端口数 {len(target_ports)} ≤ {BLACKHOLE_MIN_PORTS}，"
-              f"跳过黑洞IP过滤", flush=True)
+        # 跳过预筛：直接对所有目标做 TLS。对有扫描检测的服务商更可靠，
+        # 因为不存在"TCP 被丢包 → 误判关闭 → TLS 没机会验"这条损失路径。
+        open_ports = [(ip, p) for p in target_ports for ip in all_ips]
+        print(f"\n[0/3 阶段零] TCP预筛已禁用，"
+              f"直接对全部 {len(open_ports):,} 个目标做 TLS", flush=True)
+        print(f"[*] TLS 第一阶段预估约 "
+              f"{len(open_ports) / (TLS_CONCURRENCY / STAGE1_TIMEOUT) / 60:.0f} 分钟",
+              flush=True)
 
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
 
     # ==================== 第一阶段：CF 证书 ====================
     print(f"\n[1/3 第一阶段 TLS 探测] 校验 {len(open_ports):,} 个"
-          f"（握手失败重试 {TLS_RETRY} 次）...", flush=True)
+          f"（并发={TLS_CONCURRENCY} 握手失败重试 {TLS_RETRY} 次）...", flush=True)
     r1 = await gather_staged(
         open_ports,
         lambda ip, p: retry_check(check_tls_sni_async, ip, p,
