@@ -49,10 +49,11 @@ jobs:
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
         run: |
-          # 不设 TCP_STAGE / TLS_CONC：脚本内 ASN_PROFILES 会自动为 25820
-          # 关闭 TCP 预筛并把 TLS 并发降到 200（该 ASN 有扫描检测，
-          # 预筛会让本机在 TLS 阶段前被限速，实测 516 → 7）
-          python check_cf_asn.py "25820" "IT7" "443"
+          # 用 v1 原版脚本：多进程 + 50并发/核 + 2s超时 + 无TCP预筛。
+          # AS25820 有扫描检测，新版单进程 200 并发在累计约 12 万次 TLS 后
+          # 被限速（一阶段斜率掉 50 倍，最终只出 5 个）；原版实测 51-68 分钟
+          # 出 516 个。DMIT / xTom 继续用 check_cf_asn.py。
+          python check_cf_asn_v1.py "25820" "IT7" "443"
 
       - name: Push result to private repo
         env:
