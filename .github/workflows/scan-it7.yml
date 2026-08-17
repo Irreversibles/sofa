@@ -2,8 +2,8 @@ name: Scan IT7 (AS25820)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 3 * * 3'   # 周三，和 DMIT(周一)、xTom(周二) 错开
+  #schedule:
+    #- cron: '0 3 * * 3'   # 周三，和 DMIT(周一)、xTom(周二) 错开
 
 concurrency:
   group: scan-it7
