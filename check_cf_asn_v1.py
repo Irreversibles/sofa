@@ -51,7 +51,7 @@ except ImportError:
 DEFAULT_TARGET = os.getenv("ASN_LIST", "AS36002")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "auto")
 DEFAULT_PORTS = os.getenv("PORTS", "443,8443,2053,2083,2096")
-CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
+CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
