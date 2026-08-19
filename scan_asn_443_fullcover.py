@@ -4,6 +4,7 @@ import os
 import sys
 import re
 import json
+import time
 import ipaddress
 import random
 import socket
@@ -43,6 +44,7 @@ CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 GEOIP_DB = "GeoLite2-Country.mmdb"
 STATE_DIR = "state"
 ASN_FETCH_TIMEOUT = int(os.getenv("ASN_FETCH_TIMEOUT", "20"))
+META_TTL_SEC = int(os.getenv("META_TTL_SEC", str(7 * 86400)))  # 前缀元数据缓存7天
 
 # 阶段零：TCP 探活（全量443）
 TCP_CONCURRENCY = int(os.getenv("TCP_CONCURRENCY", "2500"))
@@ -123,7 +125,7 @@ def get_asn_prefixes(asn_clean):
         try:
             url = f"https://api.bgpview.io/asn/{asn_clean}/prefixes"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=ASN_FETCH_TIMEOUT) as response:
+            with urllib.request.urlopen(url, timeout=ASN_FETCH_TIMEOUT) as response:
                 data = json.loads(response.read().decode())
                 for p in data.get("data", {}).get("ipv4_prefixes", []):
                     prefix = p.get("prefix")
@@ -161,13 +163,28 @@ def _load_or_build_meta(asn_clean):
         try:
             with open(mfile, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if "meta" in d and "total_ips" in d:
+            built = d.get("built_ts", 0)
+            age = time.time() - built
+            if "meta" in d and "total_ips" in d and age < META_TTL_SEC:
+                print(f"[*] 前缀元数据缓存命中（{age/86400:.1f}天前构建）", flush=True)
                 return d["meta"], int(d["total_ips"])
+            else:
+                print(f"[*] 前缀元数据已过期（{age/86400:.1f}天），重新拉取", flush=True)
         except Exception:
             pass
 
     cidrs = get_asn_prefixes(asn_clean)
     if not cidrs:
+        # 拉取失败时，若有旧缓存则降级沿用，避免整轮空跑
+        if os.path.exists(mfile):
+            try:
+                with open(mfile, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if "meta" in d and "total_ips" in d:
+                    print("[!] 前缀拉取失败，降级沿用旧缓存", flush=True)
+                    return d["meta"], int(d["total_ips"])
+            except Exception:
+                pass
         return [], 0
 
     meta = []
@@ -193,7 +210,8 @@ def _load_or_build_meta(asn_clean):
     with open(mfile, "w", encoding="utf-8") as f:
         json.dump({
             "asn": asn_clean,
-            "updated_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+            "built_ts": int(time.time()),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "prefix_count": len(cidrs),
             "segment_count": len(meta),
             "total_ips": total_ips,
@@ -231,7 +249,6 @@ def _load_or_init_state(asn_clean, total_ips):
     }
 
 def _save_state(asn_clean, s):
-    import time
     s["last_run_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     sfile = _state_file(asn_clean)
     tmp = sfile + ".tmp"
@@ -252,6 +269,7 @@ def _next_batch(meta, s, budget):
     need = int(budget)
     wrapped = False
     out = []
+    added_this_round = 0    # 本批中属于“当前轮”的计数（跨轮后重新累计）
 
     while need > 0:
         seg = meta[idx]
@@ -263,6 +281,7 @@ def _next_batch(meta, s, budget):
             if idx >= n:
                 idx = 0
                 wrapped = True
+                added_this_round = 0    # 跨过尾部，新一轮从这里开始计
             continue
 
         take = min(need, cnt - off)
@@ -274,6 +293,7 @@ def _next_batch(meta, s, budget):
 
         off += take
         need -= take
+        added_this_round += take
 
         if off >= cnt:
             off = 0
@@ -281,10 +301,11 @@ def _next_batch(meta, s, budget):
             if idx >= n:
                 idx = 0
                 wrapped = True
+                added_this_round = 0
 
     if wrapped:
         s["round"] = int(s["round"]) + 1
-        s["scanned_this_round"] = len(out)
+        s["scanned_this_round"] = added_this_round
     else:
         s["scanned_this_round"] = int(s.get("scanned_this_round", 0)) + len(out)
 
@@ -511,7 +532,11 @@ async def main():
     if wrapped:
         print(f"[!] 已跨越尾部，进入新一轮 round={s['round']}", flush=True)
 
-    print(f"[*] 本轮扫描 IP 数: {len(batch_ips):,}（仅端口 443）", flush=True)
+    # 打乱本批：顺序扫连续 IP 段极易触发云厂商扫描检测/限速，
+    # 打乱后同一时刻的并发落在分散地址上（不影响覆盖，游标已记录进度）
+    random.shuffle(batch_ips)
+
+    print(f"[*] 本轮扫描 IP 数: {len(batch_ips):,}（仅端口 443，已打乱顺序）", flush=True)
 
     # 4) TCP 443 探活
     alive_ips = await scan_tcp_443(batch_ips)
