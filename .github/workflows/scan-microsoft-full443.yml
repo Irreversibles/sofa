@@ -1,0 +1,105 @@
+name: Scan Microsoft Full443
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 UTC 06:00 和 18:00 执行
+    # 对应北京时间 14:00 和 02:00
+    - cron: '0 6,18 * * *'
+
+concurrency:
+  group: scan-microsoft-full443
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download GeoIP Database
+        run: |
+          for i in 1 2 3; do
+            curl -L --fail -o GeoLite2-Country.mmdb \
+              https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb && break
+            echo "retry $i..."; sleep 5
+          done
+
+      - name: Pull old results and state
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          cp result_repo/Microsoft.txt ./ 2>/dev/null || true
+          mkdir -p state
+          cp result_repo/state/*.json state/ 2>/dev/null || true
+
+      - name: Run Scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          BUDGET_IPS: "400000"
+        run: |
+          python check_cf_asn_full443.py "AS8075" "Microsoft"
+
+      - name: Push result to private repo
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          if [ ! -s Microsoft.txt ]; then
+            echo "Microsoft.txt 不存在或为空，本次无结果，跳过推送"
+            exit 0
+          fi
+
+          cp Microsoft.txt result_repo/
+          mkdir -p result_repo/state
+          cp state/*.json result_repo/state/ 2>/dev/null || true
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Microsoft.txt state/*.json
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "auto: update Microsoft full443"
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push 冲突，第 $i 次重试..."
+              git pull --rebase --autostash || exit 1
+              sleep $((RANDOM % 10 + 5))
+            done
+          fi
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ 扫描完成%0A服务商: Microsoft%0A目标: AS8075%0A本次新增: ${COUNT} 个"
+          else
+            MSG="❌ 扫描失败%0A服务商: Microsoft%0A目标: AS8075%0A状态: ${{ job.status }}"
+          fi
+          echo "发送内容: ${MSG}"
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}")
+          echo "$RESP"
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
