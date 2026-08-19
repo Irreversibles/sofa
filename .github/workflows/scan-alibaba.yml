@@ -52,7 +52,7 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-          BUDGET_IPS: "400000"
+          BUDGET_IPS: "2000000"
         run: |
           python check_cf_asn_full443.py "AS45102" "Alibaba"
 
