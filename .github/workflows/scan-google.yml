@@ -52,7 +52,7 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-          BUDGET_IPS: "5000000"
+          BUDGET_IPS: "3000000"
         run: |
           python check_cf_asn_full443.py "396982,19527" "Google"
 
