@@ -3,8 +3,7 @@ name: Scan Microsoft Full443
 on:
   workflow_dispatch:
   schedule:
-    # 每天 UTC 06:00 和 18:00 执行
-    # 对应北京时间 14:00 和 02:00
+    # UTC 06:00 / 18:00 —— 北京 14:00 / 02:00
     - cron: '0 6,18 * * *'
 
 concurrency:
@@ -47,7 +46,8 @@ jobs:
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
           cp result_repo/Microsoft.txt ./ 2>/dev/null || true
           mkdir -p state
-          cp result_repo/state/*.json state/ 2>/dev/null || true
+          cp result_repo/state/prefix_meta_AS8075.json state/ 2>/dev/null || true
+          cp result_repo/state/fullcover_state_AS8075.json state/ 2>/dev/null || true
 
       - name: Run Scan
         env:
@@ -60,19 +60,18 @@ jobs:
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
-          if [ ! -s Microsoft.txt ]; then
-            echo "Microsoft.txt 不存在或为空，本次无结果，跳过推送"
-            exit 0
-          fi
-
-          cp Microsoft.txt result_repo/
+          cp Microsoft.txt result_repo/ 2>/dev/null || true
           mkdir -p result_repo/state
-          cp state/*.json result_repo/state/ 2>/dev/null || true
+          cp state/prefix_meta_AS8075.json result_repo/state/ 2>/dev/null || true
+          cp state/fullcover_state_AS8075.json result_repo/state/ 2>/dev/null || true
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add Microsoft.txt state/*.json
+          git add Microsoft.txt || true
+          git add state/prefix_meta_AS8075.json || true
+          git add state/fullcover_state_AS8075.json || true
+
           if git diff --staged --quiet; then
             echo "no change"
           else
