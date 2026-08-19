@@ -36,9 +36,8 @@ except ImportError:
     UVLOOP_ENABLED = False
 
 # ==================== 配置 ====================
-DEFAULT_TARGET = os.getenv("ASN_LIST", "AS45102")
+DEFAULT_TARGET = os.getenv("ASN_LIST", "45102")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "Alibaba")
-DEFAULT_PORTS = "443"  # 全量扫描固定443
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
@@ -52,7 +51,7 @@ TCP_TIMEOUT = float(os.getenv("TCP_TIMEOUT", "3.0"))
 BUDGET_IPS = int(os.getenv("BUDGET_IPS", "200000"))
 TCP_BATCH = int(os.getenv("TCP_BATCH", "50000"))
 
-# 三阶段 TLS/HTTP 筛选（与原大号一致）
+# 三阶段 TLS/HTTP 筛选
 TLS_CONCURRENCY = int(os.getenv("TLS_CONCURRENCY", "300"))
 TLS_CHUNK = 20000
 STAGE1_TIMEOUT = 3
@@ -73,15 +72,6 @@ try:
 except Exception:
     geo_reader = None
 
-# ==================== ASN -> 固定名称映射 ====================
-ASN_NAME_MAP = {
-    "45102": "Alibaba",
-    "396982": "Google",
-    "8075": "Microsoft",
-}
-
-def get_fixed_name(asn_clean):
-    return ASN_NAME_MAP.get(asn_clean, None)
 
 def get_country(ip):
     if geo_reader is None:
@@ -95,18 +85,20 @@ def _safe_filename(name):
     cleaned = re.sub(r'[^\w.-]', '_', name).strip('._')
     return cleaned or "RESULT"
 
-def resolve_name(target_input, name_arg):
-    # 优先使用固定映射名
-    asn_clean = target_input.upper().replace("AS", "").strip()
-    fixed = get_fixed_name(asn_clean)
-    if fixed:
-        print(f"[*] AS{asn_clean} 使用固定名称: {fixed}", flush=True)
-        return fixed
-    if name_arg and name_arg.lower() != "auto":
-        return _safe_filename(name_arg)
-    return f"AS{asn_clean}"
+def resolve_name(name_arg):
+    return _safe_filename(name_arg or "RESULT")
 
-@lru_cache(maxsize=32)
+def parse_asn_list(target_input):
+    """支持逗号/空格分隔的多 ASN：'45102,37963' 或 'AS45102 AS37963'"""
+    parts = re.split(r'[\s,]+', str(target_input).strip())
+    asns = []
+    for p in parts:
+        c = p.upper().replace("AS", "").strip()
+        if c.isdigit() and c not in asns:
+            asns.append(c)
+    return asns
+
+@lru_cache(maxsize=64)
 def get_asn_prefixes(asn_clean):
     cidrs = []
     try:
@@ -119,20 +111,20 @@ def get_asn_prefixes(asn_clean):
                 if prefix and ":" not in prefix:
                     cidrs.append(prefix)
     except Exception as e:
-        print(f"[!] RIPE 拉取失败({type(e).__name__})，尝试 bgpview...", flush=True)
+        print(f"[!] AS{asn_clean} RIPE 拉取失败({type(e).__name__})，尝试 bgpview...", flush=True)
 
     if not cidrs:
         try:
             url = f"https://api.bgpview.io/asn/{asn_clean}/prefixes"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(url, timeout=ASN_FETCH_TIMEOUT) as response:
+            with urllib.request.urlopen(req, timeout=ASN_FETCH_TIMEOUT) as response:
                 data = json.loads(response.read().decode())
                 for p in data.get("data", {}).get("ipv4_prefixes", []):
                     prefix = p.get("prefix")
                     if prefix:
                         cidrs.append(prefix)
         except Exception as e:
-            print(f"[-] bgpview 也失败: {type(e).__name__}", flush=True)
+            print(f"[-] AS{asn_clean} bgpview 也失败: {type(e).__name__}", flush=True)
 
     cidrs = sorted(set(cidrs))
     if cidrs:
@@ -149,33 +141,70 @@ def _usable_range(net):
     c = max(0, e - s + 1)
     return s, e, c
 
-def _meta_file(asn_clean):
+def _meta_file(name_key):
     os.makedirs(STATE_DIR, exist_ok=True)
-    return os.path.join(STATE_DIR, f"prefix_meta_AS{asn_clean}.json")
+    return os.path.join(STATE_DIR, f"prefix_meta_{name_key}.json")
 
-def _state_file(asn_clean):
+def _state_file(name_key):
     os.makedirs(STATE_DIR, exist_ok=True)
-    return os.path.join(STATE_DIR, f"fullcover_state_AS{asn_clean}.json")
+    return os.path.join(STATE_DIR, f"fullcover_state_{name_key}.json")
 
-def _load_or_build_meta(asn_clean):
-    mfile = _meta_file(asn_clean)
+def _build_meta_from_asns(asn_list):
+    """拉取一组 ASN 的所有前缀，合并去重（collapse 掉重叠/相邻段），构建有序 meta"""
+    all_cidrs = []
+    for asn in asn_list:
+        all_cidrs.extend(get_asn_prefixes(asn))
+
+    nets = []
+    for c in all_cidrs:
+        try:
+            n = ipaddress.ip_network(c, strict=False)
+            if n.version == 4:
+                nets.append(n)
+        except Exception:
+            continue
+    if not nets:
+        return [], 0
+
+    # collapse：多个 ASN 间的重叠段合并，避免重复扫
+    collapsed = list(ipaddress.collapse_addresses(nets))
+
+    meta = []
+    total_ips = 0
+    for net in collapsed:
+        s, e, cnt = _usable_range(net)
+        if cnt <= 0:
+            continue
+        meta.append({"cidr": str(net), "start": s, "end": e, "count": cnt})
+        total_ips += cnt
+    meta.sort(key=lambda m: m["start"])   # 游标稳定推进
+    return meta, total_ips
+
+def _load_or_build_meta(name_key, asn_list):
+    mfile = _meta_file(name_key)
+    asn_set = sorted(asn_list)
+
     if os.path.exists(mfile):
         try:
             with open(mfile, "r", encoding="utf-8") as f:
                 d = json.load(f)
             built = d.get("built_ts", 0)
             age = time.time() - built
-            if "meta" in d and "total_ips" in d and age < META_TTL_SEC:
-                print(f"[*] 前缀元数据缓存命中（{age/86400:.1f}天前构建）", flush=True)
+            cached_asns = sorted(d.get("asns", []))
+            if "meta" in d and "total_ips" in d and cached_asns == asn_set and age < META_TTL_SEC:
+                print(f"[*] 前缀元数据缓存命中（{age/86400:.1f}天前构建，ASN组={asn_set}）", flush=True)
                 return d["meta"], int(d["total_ips"])
+            elif cached_asns != asn_set:
+                print(f"[*] ASN 组变化 {cached_asns} -> {asn_set}，重建元数据", flush=True)
             else:
                 print(f"[*] 前缀元数据已过期（{age/86400:.1f}天），重新拉取", flush=True)
         except Exception:
             pass
 
-    cidrs = get_asn_prefixes(asn_clean)
-    if not cidrs:
-        # 拉取失败时，若有旧缓存则降级沿用，避免整轮空跑
+    meta, total_ips = _build_meta_from_asns(asn_list)
+
+    if not meta:
+        # 拉取失败时降级沿用旧缓存，避免整轮空跑
         if os.path.exists(mfile):
             try:
                 with open(mfile, "r", encoding="utf-8") as f:
@@ -187,32 +216,12 @@ def _load_or_build_meta(asn_clean):
                 pass
         return [], 0
 
-    meta = []
-    total_ips = 0
-    for c in cidrs:
-        try:
-            net = ipaddress.ip_network(c, strict=False)
-            if net.version != 4:
-                continue
-            s, e, cnt = _usable_range(net)
-            if cnt <= 0:
-                continue
-            meta.append({
-                "cidr": str(net),
-                "start": s,
-                "end": e,
-                "count": cnt
-            })
-            total_ips += cnt
-        except Exception:
-            continue
-
     with open(mfile, "w", encoding="utf-8") as f:
         json.dump({
-            "asn": asn_clean,
+            "name": name_key,
+            "asns": asn_set,
             "built_ts": int(time.time()),
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "prefix_count": len(cidrs),
             "segment_count": len(meta),
             "total_ips": total_ips,
             "meta": meta
@@ -220,26 +229,31 @@ def _load_or_build_meta(asn_clean):
 
     return meta, total_ips
 
-def _load_or_init_state(asn_clean, total_ips):
-    sfile = _state_file(asn_clean)
+def _load_or_init_state(name_key, asn_list, total_ips):
+    sfile = _state_file(name_key)
+    asn_set = sorted(asn_list)
     if os.path.exists(sfile):
         try:
             with open(sfile, "r", encoding="utf-8") as f:
                 s = json.load(f)
             if all(k in s for k in ("cursor_prefix_index", "cursor_offset", "round", "scanned_this_round")):
-                if int(s.get("total_ips", 0)) != int(total_ips):
-                    print(f"[!] total_ips 变化: {s.get('total_ips')} -> {total_ips}，重置游标", flush=True)
+                # total_ips 或 ASN 组变化 → 段结构变了，游标失去意义，重置
+                if int(s.get("total_ips", 0)) != int(total_ips) or sorted(s.get("asns", [])) != asn_set:
+                    print(f"[!] 段结构变化（total {s.get('total_ips')}→{total_ips} / "
+                          f"asns {sorted(s.get('asns', []))}→{asn_set}），重置游标", flush=True)
                     s["cursor_prefix_index"] = 0
                     s["cursor_offset"] = 0
                     s["scanned_this_round"] = 0
                     s["total_ips"] = total_ips
+                    s["asns"] = asn_set
                 return s
         except Exception:
             pass
 
     return {
-        "asn": asn_clean,
-        "version": 1,
+        "name": name_key,
+        "asns": asn_set,
+        "version": 2,
         "cursor_prefix_index": 0,
         "cursor_offset": 0,
         "round": 1,
@@ -248,9 +262,9 @@ def _load_or_init_state(asn_clean, total_ips):
         "last_run_utc": "",
     }
 
-def _save_state(asn_clean, s):
+def _save_state(name_key, s):
     s["last_run_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    sfile = _state_file(asn_clean)
+    sfile = _state_file(name_key)
     tmp = sfile + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
@@ -266,10 +280,12 @@ def _next_batch(meta, s, budget):
     n = len(meta)
     idx = int(s["cursor_prefix_index"])
     off = int(s["cursor_offset"])
+    if idx >= n:      # 段数变少时的越界保护
+        idx, off = 0, 0
     need = int(budget)
     wrapped = False
     out = []
-    added_this_round = 0    # 本批中属于“当前轮”的计数（跨轮后重新累计）
+    added_this_round = 0
 
     while need > 0:
         seg = meta[idx]
@@ -281,7 +297,7 @@ def _next_batch(meta, s, budget):
             if idx >= n:
                 idx = 0
                 wrapped = True
-                added_this_round = 0    # 跨过尾部，新一轮从这里开始计
+                added_this_round = 0
             continue
 
         take = min(need, cnt - off)
@@ -311,11 +327,9 @@ def _next_batch(meta, s, budget):
 
     s["cursor_prefix_index"] = idx
     s["cursor_offset"] = off
-
     return out, s, wrapped
 # ==================== TCP 443 探活 ====================
 async def tcp_open_443(ip, sem):
-    """纯 TCP 443 握手。成功返回 ip，失败返回 None"""
     async with sem:
         writer = None
         try:
@@ -337,7 +351,6 @@ async def tcp_open_443(ip, sem):
 
 
 async def scan_tcp_443(ips):
-    """分块并发扫描 443，返回开放 IP 列表"""
     sem = asyncio.Semaphore(TCP_CONCURRENCY)
     alive = []
     total = len(ips)
@@ -351,7 +364,7 @@ async def scan_tcp_443(ips):
     return alive
 
 
-# ==================== 三阶段 TLS/HTTP 筛选（与你大号原逻辑一致） ====================
+# ==================== 三阶段 TLS/HTTP 筛选 ====================
 def match_domain_in_cert(sni_domain, cert_str):
     sni_domain = sni_domain.lower()
     cert_str = cert_str.lower()
@@ -368,7 +381,6 @@ def match_domain_in_cert(sni_domain, cert_str):
 
 
 async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
-    """True=证书匹配 / False=明确不匹配 / None=握手未完成（可重试）"""
     async with sem:
         writer = None
         try:
@@ -397,7 +409,6 @@ async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
 
 
 async def check_http_async(ip, port, host, timeout_val, sem):
-    """True=拿到301/302 / False=拿到响应但不符 / None=没拿到响应（可重试）"""
     async with sem:
         writer = None
         try:
@@ -428,7 +439,6 @@ async def check_http_async(ip, port, host, timeout_val, sem):
 
 
 async def retry_check(fn, ip, port, arg, timeout_val, sem):
-    """三态重试：None（握手未完成）才重试，False（明确不符）立即返回"""
     for attempt in range(TLS_RETRY + 1):
         r = await fn(ip, port, arg, timeout_val, sem)
         if r is not None:
@@ -439,7 +449,6 @@ async def retry_check(fn, ip, port, arg, timeout_val, sem):
 
 
 async def gather_staged(items, make_coro, label):
-    """分块执行 + 进度打印，避免大批量时日志长时间静默"""
     total = len(items)
     results = []
     for i in range(0, total, TLS_CHUNK):
@@ -452,7 +461,7 @@ async def gather_staged(items, make_coro, label):
     return results
 
 
-# ==================== 结果保存（与你大号完全一致） ====================
+# ==================== 结果保存 ====================
 def load_old_lines(path):
     lines = set()
     try:
@@ -464,81 +473,57 @@ def load_old_lines(path):
     except FileNotFoundError:
         pass
     return lines
-
-
-def save_lines_sorted(path, lines_set):
-    def sort_key(line):
-        try:
-            addr = line.split("#")[0]
-            ip_part, port_part = addr.rsplit(":", 1)
-            country = line.split("#")[1].split()[0] if "#" in line else "??"
-            return (country, ipaddress.ip_address(ip_part), int(port_part))
-        except Exception:
-            return ("??", ipaddress.ip_address("0.0.0.0"), 0)
-
-    sorted_lines = sorted(lines_set, key=sort_key)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        for line in sorted_lines:
-            f.write(line + "\n")
-    os.replace(tmp, path)
 # ==================== 主流程 ====================
 async def main():
     target_input = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET
     name_arg = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
 
-    asn_clean = target_input.upper().replace("AS", "").strip()
-    if not asn_clean.isdigit():
-        print(f"[-] 仅支持 ASN 输入（如 AS45102 / 45102），收到: {target_input}", flush=True)
+    asn_list = parse_asn_list(target_input)
+    if not asn_list:
+        print(f"[-] 未解析到有效 ASN，收到: {target_input}", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
         return
 
-    name_label = resolve_name(target_input, name_arg)
+    name_label = resolve_name(name_arg)
+    name_key = _safe_filename(name_label)
 
     with open("name.txt", "w", encoding="utf-8") as f:
         f.write(name_label)
 
-    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | ASN=AS{asn_clean} | 名字={name_label}", flush=True)
+    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | ASN组={asn_list} | 名字={name_label}", flush=True)
     print(f"[*] 参数：TCP并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 每轮预算={BUDGET_IPS:,}", flush=True)
     print(f"[*] 端口固定：443（全量断点续扫）", flush=True)
 
-    # 1) 加载/构建前缀元数据
-    meta, total_ips = _load_or_build_meta(asn_clean)
+    meta, total_ips = _load_or_build_meta(name_key, asn_list)
     if not meta or total_ips <= 0:
         print("[-] 未获取到可扫描 IPv4 前缀。", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
         return
 
-    print(f"[+] AS{asn_clean} 可扫描主机总数: {total_ips:,} | 段数: {len(meta):,}", flush=True)
+    print(f"[+] {name_label}(ASN组{asn_list}) 可扫描主机总数: {total_ips:,} | 段数: {len(meta):,}", flush=True)
 
-    # 2) 加载/初始化扫描状态
-    s = _load_or_init_state(asn_clean, total_ips)
+    s = _load_or_init_state(name_key, asn_list, total_ips)
     print(f"[*] 当前状态: round={s['round']} "
           f"cursor=({s['cursor_prefix_index']},{s['cursor_offset']}) "
           f"scanned_this_round={s.get('scanned_this_round',0):,}/{total_ips:,}",
           flush=True)
 
-    # 3) 生成本轮待扫描IP
     batch_ips, s, wrapped = _next_batch(meta, s, BUDGET_IPS)
     if not batch_ips:
         print("[!] 本轮无目标，退出。", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
-        _save_state(asn_clean, s)
+        _save_state(name_key, s)
         return
 
     if wrapped:
         print(f"[!] 已跨越尾部，进入新一轮 round={s['round']}", flush=True)
 
-    # 打乱本批：顺序扫连续 IP 段极易触发云厂商扫描检测/限速，
-    # 打乱后同一时刻的并发落在分散地址上（不影响覆盖，游标已记录进度）
     random.shuffle(batch_ips)
-
     print(f"[*] 本轮扫描 IP 数: {len(batch_ips):,}（仅端口 443，已打乱顺序）", flush=True)
 
-    # 4) TCP 443 探活
     alive_ips = await scan_tcp_443(batch_ips)
     print(f"[+] 本轮 TCP 开放 443: {len(alive_ips):,}", flush=True)
 
@@ -546,13 +531,11 @@ async def main():
         with open("count.txt", "w") as f:
             f.write("0")
         print("[-] 无开放 443，跳过三阶段，不覆盖已有结果。", flush=True)
-        _save_state(asn_clean, s)
+        _save_state(name_key, s)
         return
 
-    # 5) 三阶段筛选（与原大号逻辑完全一致）
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
 
-    # 第一阶段：CF 证书
     targets = [(ip, 443) for ip in alive_ips]
     print(f"\n[1/3 第一阶段 TLS 探测] 校验 {len(targets):,} 个...", flush=True)
     r1 = await gather_staged(
@@ -566,10 +549,9 @@ async def main():
         with open("count.txt", "w") as f:
             f.write("0")
         print("[-] 无有效目标通过第一阶段。", flush=True)
-        _save_state(asn_clean, s)
+        _save_state(name_key, s)
         return
 
-    # 第二阶段：crypto 301
     print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1):,} 个候选...", flush=True)
     r2 = await gather_staged(
         pass_1,
@@ -582,10 +564,9 @@ async def main():
         with open("count.txt", "w") as f:
             f.write("0")
         print("[-] 无有效目标通过第二阶段。", flush=True)
-        _save_state(asn_clean, s)
+        _save_state(name_key, s)
         return
 
-    # 第三阶段：自定义域名
     final_items = pass_2
     if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
         domain = CUSTOM_CF_DOMAIN.strip()
@@ -605,10 +586,9 @@ async def main():
             f.write("0")
         print("\n==================== 扫描结束 ====================", flush=True)
         print("[!] 本次无有效结果，跳过写文件，不覆盖已有结果。", flush=True)
-        _save_state(asn_clean, s)
+        _save_state(name_key, s)
         return
 
-    # 6) 结果输出（与你大号完全一致）
     output_filename = f"{name_label}.txt"
     old_lines = load_old_lines(output_filename)
     old_count = len(old_lines)
@@ -637,7 +617,7 @@ async def main():
               f"疑似读取异常，不覆盖！", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
-        _save_state(asn_clean, s)
+        _save_state(name_key, s)
         return
 
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
@@ -647,7 +627,7 @@ async def main():
     with open("count.txt", "w") as f:
         f.write(str(new_count))
 
-    _save_state(asn_clean, s)
+    _save_state(name_key, s)
 
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
