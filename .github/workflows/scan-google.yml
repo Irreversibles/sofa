@@ -46,15 +46,15 @@ jobs:
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
           cp result_repo/Google.txt ./ 2>/dev/null || true
           mkdir -p state
-          cp result_repo/state/prefix_meta_AS396982.json state/ 2>/dev/null || true
-          cp result_repo/state/fullcover_state_AS396982.json state/ 2>/dev/null || true
+          cp result_repo/state/prefix_meta_Google.json state/ 2>/dev/null || true
+          cp result_repo/state/fullcover_state_Google.json state/ 2>/dev/null || true
 
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
           BUDGET_IPS: "5000000"
         run: |
-          python check_cf_asn_full443.py "AS396982" "Google"
+          python check_cf_asn_full443.py "396982,19527" "Google"
 
       - name: Push result to private repo
         env:
@@ -62,15 +62,15 @@ jobs:
         run: |
           cp Google.txt result_repo/ 2>/dev/null || true
           mkdir -p result_repo/state
-          cp state/prefix_meta_AS396982.json result_repo/state/ 2>/dev/null || true
-          cp state/fullcover_state_AS396982.json result_repo/state/ 2>/dev/null || true
+          cp state/prefix_meta_Google.json result_repo/state/ 2>/dev/null || true
+          cp state/fullcover_state_Google.json result_repo/state/ 2>/dev/null || true
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add Google.txt || true
-          git add state/prefix_meta_AS396982.json || true
-          git add state/fullcover_state_AS396982.json || true
+          git add state/prefix_meta_Google.json || true
+          git add state/fullcover_state_Google.json || true
 
           if git diff --staged --quiet; then
             echo "no change"
@@ -89,9 +89,9 @@ jobs:
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
           if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: Google%0A目标: AS396982%0A本次新增: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: Google%0AASN: 396982+19527%0A本次新增: ${COUNT} 个"
           else
-            MSG="❌ 扫描失败%0A服务商: Google%0A目标: AS396982%0A状态: ${{ job.status }}"
+            MSG="❌ 扫描失败%0A服务商: Google%0A状态: ${{ job.status }}"
           fi
           echo "发送内容: ${MSG}"
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
