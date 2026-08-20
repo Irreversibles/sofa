@@ -17,11 +17,13 @@ API_RETRY = 2                 # API 异常时的重试次数
 MIN_SURVIVE_RATIO = 0.15      # 存活率过低不覆盖（防API抽风误删）
 API_ERROR_ABORT_RATIO = 0.3   # API异常占比超过此值 → 判定故障，整个文件不动
 
-# 这些国家的条目不参与复验，原样保留，不探测、不剔除
-KEEP_COUNTRIES = {"CN"}
-
 SKIP_FILES = {"count.txt", "name.txt", "requirements.txt",
               "ip.txt", "recheck_summary.txt"}
+
+# ==================== 新增：跳过国家配置 ====================
+# 这些国家的条目不参与复验、不剔除、不被探测，原样保留。
+# 这里用于跳过 CN Alibaba，避免自己扫出的国内IP被误判剔除。
+KEEP_COUNTRIES = {"CN"}
 
 
 def parse_line(line):
@@ -106,6 +108,14 @@ def sort_key(line):
         return ("??", ipaddress.ip_address("0.0.0.0"), 0)
 
 
+def format_line(ip, port, country, name):
+    """把条目格式化为 ip:port#country name，去掉尾部多余空格"""
+    parts = [f"{ip}:{port}#{country}"]
+    if name:
+        parts.append(name)
+    return " ".join(parts).rstrip()
+
+
 async def main():
     if len(sys.argv) < 2:
         print("[-] 用法: python recheck_api.py 文件1.txt [文件2.txt ...]", flush=True)
@@ -128,38 +138,36 @@ async def main():
                 continue
 
             items = []
-            keep_lines = []
+            keep_lines = []   # 需要原样保留的行（CN 等跳过国家 + 无法解析的行）
             with open(fname, "r", encoding="utf-8") as f:
                 for line in f:
                     raw = line.strip()
                     if not raw:
                         continue
-                    p = parse_line(line)
+                    p = parse_line(raw)
                     if p:
                         ip, port, country, name = p
-                        # 跳过指定国家的条目：不探测、不剔除、原样保留
                         if country.upper() in KEEP_COUNTRIES:
+                            # 跳过国家：不探测、不剔除、原样保留
                             keep_lines.append(raw)
                             continue
                         items.append((ip, port, country, name))
                     else:
+                        # 解析失败的行也原样保留，避免误删
                         keep_lines.append(raw)
 
             total = len(items)
+            skipped = len(keep_lines)
+            if total == 0 and skipped:
+                print(f"[跳过] {fname} 全部为保留国家/无效行（{skipped} 行），不检测、不改动。", flush=True)
+                continue
             if total == 0:
-                if keep_lines:
-                    # 全部都是跳过条目 → 原样写回，不做任何变更
-                    with open(fname, "w", encoding="utf-8", newline="\n") as f:
-                        for line in sorted(set(keep_lines), key=sort_key):
-                            f.write(line + "\n")
-                    print(f"[跳过] {fname} 全部为保留国家条目，原样写回，不改动。", flush=True)
-                    continue
                 print(f"[!] {fname} 无有效行，跳过。", flush=True)
                 continue
 
-            print(f"\n[*] 复验 {fname}：共 {total} 条待复验"
-                  f"（另有 {len(keep_lines)} 条保留国家跳过）"
-                  f"（并发{CONCURRENCY} 超时{TIMEOUT}s 重试{API_RETRY}）...", flush=True)
+            print(f"\n[*] 复验 {fname}：共 {total} 条待检测"
+                  f"（含 {skipped} 条保留国家不入检；并发{CONCURRENCY} "
+                  f"超时{TIMEOUT}s 重试{API_RETRY}）...", flush=True)
             results = await asyncio.gather(
                 *[check_one(session, ip, port, sem) for ip, port, _, _ in items]
             )
@@ -178,8 +186,8 @@ async def main():
             alive_count = len(alive)
             err_ratio = len(unknown) / total
             print(f"[+] {fname}：存活 {alive_count} / 失效 {len(dead)} / "
-                  f"API异常 {len(unknown)} / 保留国跳过 {len(keep_lines)}"
-                  f"（共 {total + len(keep_lines)}）", flush=True)
+                  f"API异常 {len(unknown)} / 保留国家 {skipped} "
+                  f"（共 {total + skipped}）", flush=True)
 
             # 保护一：API 异常占比过高 → 整个文件不动
             if err_ratio > API_ERROR_ABORT_RATIO:
@@ -201,19 +209,19 @@ async def main():
                 for ip, port, _ in dead:
                     print(f"    - {ip}:{port}", flush=True)
 
-            out_lines = set(keep_lines)
+            out_lines = set(keep_lines)   # CN 及无效行原样写回
             for ip, port, country, name in alive:
-                out_lines.add(f"{ip}:{port}#{country} {name}".rstrip())
+                out_lines.add(format_line(ip, port, country, name))
             for ip, port, country, name in unknown:
-                out_lines.add(f"{ip}:{port}#{country} {name}".rstrip())
+                out_lines.add(format_line(ip, port, country, name))
 
             with open(fname, "w", encoding="utf-8", newline="\n") as f:
                 for line in sorted(out_lines, key=sort_key):
                     f.write(line + "\n")
 
             print(f"[+] {fname} 已更新：剔除 {removed} 个失效，"
-                  f"保留 {len(out_lines)} 个（含 {len(unknown)} 个待下轮复验"
-                  f"和 {len(keep_lines)} 个保留国家）。", flush=True)
+                  f"保留 {len(out_lines)} 个"
+                  f"（含 {skipped} 个保留国家 + {len(unknown)} 个待下轮复验）。", flush=True)
 
     with open("recheck_summary.txt", "w", encoding="utf-8") as f:
         for name, count in removed_summary.items():
