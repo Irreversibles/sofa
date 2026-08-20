@@ -17,6 +17,9 @@ API_RETRY = 2                 # API 异常时的重试次数
 MIN_SURVIVE_RATIO = 0.15      # 存活率过低不覆盖（防API抽风误删）
 API_ERROR_ABORT_RATIO = 0.3   # API异常占比超过此值 → 判定故障，整个文件不动
 
+# 这些国家的条目不参与复验，原样保留，不探测、不剔除
+KEEP_COUNTRIES = {"CN"}
+
 SKIP_FILES = {"count.txt", "name.txt", "requirements.txt",
               "ip.txt", "recheck_summary.txt"}
 
@@ -125,18 +128,37 @@ async def main():
                 continue
 
             items = []
+            keep_lines = []
             with open(fname, "r", encoding="utf-8") as f:
                 for line in f:
+                    raw = line.strip()
+                    if not raw:
+                        continue
                     p = parse_line(line)
                     if p:
-                        items.append(p)
+                        ip, port, country, name = p
+                        # 跳过指定国家的条目：不探测、不剔除、原样保留
+                        if country.upper() in KEEP_COUNTRIES:
+                            keep_lines.append(raw)
+                            continue
+                        items.append((ip, port, country, name))
+                    else:
+                        keep_lines.append(raw)
 
             total = len(items)
             if total == 0:
+                if keep_lines:
+                    # 全部都是跳过条目 → 原样写回，不做任何变更
+                    with open(fname, "w", encoding="utf-8", newline="\n") as f:
+                        for line in sorted(set(keep_lines), key=sort_key):
+                            f.write(line + "\n")
+                    print(f"[跳过] {fname} 全部为保留国家条目，原样写回，不改动。", flush=True)
+                    continue
                 print(f"[!] {fname} 无有效行，跳过。", flush=True)
                 continue
 
-            print(f"\n[*] 复验 {fname}：共 {total} 条"
+            print(f"\n[*] 复验 {fname}：共 {total} 条待复验"
+                  f"（另有 {len(keep_lines)} 条保留国家跳过）"
                   f"（并发{CONCURRENCY} 超时{TIMEOUT}s 重试{API_RETRY}）...", flush=True)
             results = await asyncio.gather(
                 *[check_one(session, ip, port, sem) for ip, port, _, _ in items]
@@ -156,7 +178,8 @@ async def main():
             alive_count = len(alive)
             err_ratio = len(unknown) / total
             print(f"[+] {fname}：存活 {alive_count} / 失效 {len(dead)} / "
-                  f"API异常 {len(unknown)}（共 {total}）", flush=True)
+                  f"API异常 {len(unknown)} / 保留国跳过 {len(keep_lines)}"
+                  f"（共 {total + len(keep_lines)}）", flush=True)
 
             # 保护一：API 异常占比过高 → 整个文件不动
             if err_ratio > API_ERROR_ABORT_RATIO:
@@ -178,7 +201,7 @@ async def main():
                 for ip, port, _ in dead:
                     print(f"    - {ip}:{port}", flush=True)
 
-            out_lines = set()
+            out_lines = set(keep_lines)
             for ip, port, country, name in alive:
                 out_lines.add(f"{ip}:{port}#{country} {name}".rstrip())
             for ip, port, country, name in unknown:
@@ -189,7 +212,8 @@ async def main():
                     f.write(line + "\n")
 
             print(f"[+] {fname} 已更新：剔除 {removed} 个失效，"
-                  f"保留 {len(out_lines)} 个（含 {len(unknown)} 个待下轮复验）。", flush=True)
+                  f"保留 {len(out_lines)} 个（含 {len(unknown)} 个待下轮复验"
+                  f"和 {len(keep_lines)} 个保留国家）。", flush=True)
 
     with open("recheck_summary.txt", "w", encoding="utf-8") as f:
         for name, count in removed_summary.items():
