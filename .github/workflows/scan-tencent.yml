@@ -3,8 +3,8 @@ name: Scan Tencent Full443
 on:
   workflow_dispatch:
   schedule:
-    # UTC 10:00 / 22:00 —— 北京 18:00 / 06:00
-    - cron: '0 10,22 * * *'
+    # 周一、周四 UTC 10:00 —— 北京 18:00，间隔3/4天
+    - cron: '0 10 * * 1,4'
 
 concurrency:
   group: scan-tencent-full443
@@ -16,7 +16,6 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: write
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -52,9 +51,9 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-          BUDGET_IPS: "2000000"
+          BUDGET_IPS: "2500000"
         run: |
-          python check_cf_asn_full443.py "132203,45090" "Tencent"
+          python check_cf_asn_full443.py "132203" "Tencent"
 
       - name: Push result to private repo
         env:
@@ -89,7 +88,7 @@ jobs:
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
           if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: Tencent%0AASN: 132203+45090%0A本次新增: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: Tencent%0AASN: 132203%0A本次新增: ${COUNT} 个"
           else
             MSG="❌ 扫描失败%0A服务商: Tencent%0A状态: ${{ job.status }}"
           fi
