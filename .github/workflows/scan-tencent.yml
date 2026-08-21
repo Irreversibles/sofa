@@ -52,7 +52,7 @@ jobs:
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
         run: |
-          python check_cf_asn.py "132203" "Tencent" "443,8443"
+          python check_cf_asn.py "132203" "Tencent" "443"
 
       - name: Push result to private repo
         env:
