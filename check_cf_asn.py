@@ -8,10 +8,12 @@ import json
 import ipaddress
 import random
 import socket
+import urllib.parse
 import urllib.request
 from collections import Counter
 from functools import lru_cache
 
+import aiohttp
 import geoip2.database
 
 
@@ -72,9 +74,7 @@ ASN_FETCH_TIMEOUT = 15    # 大 ASN 的 prefix 列表 JSON 很大，超时给足
 # 实测记录（AS25820，409,128 IP × 443）：
 #   预筛开(2500并发)              → 探活7,341 → 一阶段71  → 有效7
 #   预筛关(TLS 200, retry1, 3s)   → 40,000个跑了33分钟，全程需337分钟，会超时
-#   预筛关(TLS 200, retry0, 2s)   → 约51-68分钟（与原版一致），一阶段外推约5,600
-# 关重试的依据：40万个IP里绝大多数443关闭、瞬间回RST，而 retry 的退避
-# sleep 会把每个RST从0.2s拖到1.4s，这批目标占了全程绝大部分时间。
+#   预筛关(TLS 200, retry0, 2s)   → 约51-68分钟（与原版一致），一阶段约1,700
 ASN_PROFILES = {
     "25820": {                       # IT7NET - IT7 Networks
         "name": "IT7",
@@ -90,7 +90,7 @@ ASN_PROFILES = {
 TCP_STAGE_ENABLED = True
 TCP_CONCURRENCY = 2500
 TCP_TIMEOUT = float(os.getenv("TCP_TIMEOUT", "3.0"))
-TCP_RETRY = int(os.getenv("TCP_RETRY", "1"))    # 带退避，专治被限速丢的 SYN
+TCP_RETRY = int(os.getenv("TCP_RETRY", "1"))
 TCP_BATCH_MIN = 50000
 TCP_BATCH_MAX = 500000
 
@@ -108,6 +108,15 @@ STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
 TLS_RETRY = 1             # 仅"握手未完成"重试，"明确不符"立即放弃
+
+# ==================== 第四阶段：自建 API 确认落地 ====================
+# 三阶段只证明"TLS 能透传到 CF 边缘"，不证明"能作为 proxyip 转发"。
+# 这一步用自建 Worker 实测转发并拿真实落地国家 —— GeoIP 给的是 IP 注册地，
+# 与落地常不一致（云厂商尤其明显），所以 country 只认这里的结果。
+CHECK_API = os.getenv("CHECK_API", "https://check.tigaa.ccwu.cc/check")
+API_CONCURRENCY = int(os.getenv("API_CONC", "20"))
+API_TIMEOUT = 30
+API_RETRY = 2
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -168,8 +177,8 @@ def apply_asn_profile(asn_clean):
 
 
 def get_country(ip):
-    """GeoIP 查的是 IP 注册地，不是落地国家。
-    真实落地由 recheck_api.py 用自建 API 复验时刷新。"""
+    """GeoIP 查的是 IP 注册地，仅在 API 不可用时作兜底参考。
+    真实落地由第四阶段的自建 API 提供。"""
     if geo_reader is None:
         return "??"
     try:
@@ -433,12 +442,7 @@ async def check_http_async(ip, port, host, timeout_val, sem):
 
 
 async def retry_check(fn, ip, port, arg, timeout_val, sem):
-    """三态重试：None（握手未完成）才重试，False（明确不符）立即返回。
-
-    TLS_RETRY=0 时退化为单次探测（原版行为）。注意：本函数把 RST 也算作
-    可重试的 None，而退避 sleep 对 RST 是纯浪费 —— 大 ASN 上绝大多数
-    目标就是 RST，所以那类 ASN 应在档案里设 tls_retry=0。
-    """
+    """三态重试：None（握手未完成）才重试，False（明确不符）立即返回"""
     for attempt in range(TLS_RETRY + 1):
         r = await fn(ip, port, arg, timeout_val, sem)
         if r is not None:
@@ -446,6 +450,54 @@ async def retry_check(fn, ip, port, arg, timeout_val, sem):
         if attempt < TLS_RETRY:
             await asyncio.sleep(0.5 + random.random())
     return False
+
+
+async def api_verify(session, ip, port, sem):
+    """自建 API 确认转发能力 + 拿真实落地国家。
+
+    返回 ("ok", country) / ("dead", "??") / ("error", "??")
+    关键：区分"API 明确说不通"和"API 自己没答上来"。后者归 error，
+    不当作失效 —— 否则 API 抖一下就会丢掉好货。
+    """
+    async with sem:
+        url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
+        for attempt in range(API_RETRY + 1):
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)
+                ) as resp:
+                    if resp.status != 200:
+                        if attempt < API_RETRY:
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
+                        return ("error", "??")
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if "json" not in ctype:
+                        # CF 错误页（1027 超额 / 1102 超限）是 text/html
+                        if attempt < API_RETRY:
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
+                        return ("error", "??")
+                    data = await resp.json(content_type=None)
+            except Exception:
+                if attempt < API_RETRY:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return ("error", "??")
+
+            if data.get("success") is True:
+                country = "??"
+                for fam in ("ipv4", "ipv6"):
+                    try:
+                        c = data["probe_results"][fam]["exit"]["country"]
+                        if c:
+                            country = c
+                            break
+                    except Exception:
+                        continue
+                return ("ok", country)
+            return ("dead", "??")
+        return ("error", "??")
 
 
 async def gather_staged(items, make_coro, label):
@@ -523,7 +575,7 @@ async def main():
         print(f"[*] TCP 阶段预估约 {total / (TCP_CONCURRENCY / TCP_TIMEOUT) / 60:.0f} 分钟"
               f"（分 {(total + tcp_batch - 1) // tcp_batch} 批，每批 {tcp_batch:,}）",
               flush=True)
-        print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} "
+        print(f"\n[0/4 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} "
               f"超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
         tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
         open_ports = []
@@ -581,7 +633,7 @@ async def main():
         # 跳过预筛：直接对所有目标做 TLS。对有扫描检测的服务商更可靠，
         # 因为不存在"TCP 被丢包 → 误判关闭 → TLS 没机会验"这条损失路径。
         open_ports = [(ip, p) for p in target_ports for ip in all_ips]
-        print(f"\n[0/3 阶段零] TCP预筛已禁用，"
+        print(f"\n[0/4 阶段零] TCP预筛已禁用，"
               f"直接对全部 {len(open_ports):,} 个目标做 TLS", flush=True)
         print(f"[*] TLS 第一阶段预估最坏约 "
               f"{len(open_ports) / (TLS_CONCURRENCY / STAGE1_TIMEOUT) / 60:.0f} 分钟"
@@ -590,7 +642,7 @@ async def main():
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
 
     # ==================== 第一阶段：CF 证书 ====================
-    print(f"\n[1/3 第一阶段 TLS 探测] 校验 {len(open_ports):,} 个"
+    print(f"\n[1/4 第一阶段 TLS 探测] 校验 {len(open_ports):,} 个"
           f"（并发={TLS_CONCURRENCY} 超时={STAGE1_TIMEOUT}s "
           f"重试={TLS_RETRY}）...", flush=True)
     r1 = await gather_staged(
@@ -607,7 +659,7 @@ async def main():
         return
 
     # ==================== 第二阶段：crypto 301 ====================
-    print(f"[2/3 第二阶段 HTTP 校验] 校验 {len(pass_1):,} 个候选...", flush=True)
+    print(f"[2/4 第二阶段 HTTP 校验] 校验 {len(pass_1):,} 个候选...", flush=True)
     r2 = await gather_staged(
         pass_1,
         lambda ip, p: retry_check(check_http_async, ip, p,
@@ -625,7 +677,7 @@ async def main():
     final_items = pass_2
     if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
         domain = CUSTOM_CF_DOMAIN.strip()
-        print(f"[3/3 第三阶段自定义域名校验] 校验 {len(pass_2):,} 个...", flush=True)
+        print(f"[3/4 第三阶段自定义域名校验] 校验 {len(pass_2):,} 个...", flush=True)
         r3 = await gather_staged(
             pass_2,
             lambda ip, p: retry_check(check_tls_sni_async, ip, p,
@@ -634,12 +686,44 @@ async def main():
         final_items = [pass_2[i] for i, ok in enumerate(r3) if ok]
         print(f"[+] 第三阶段完成！有效目标: {len(final_items):,} 个", flush=True)
     else:
-        print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，跳过。", flush=True)
+        print("[3/4] 未检测到 CUSTOM_CF_DOMAIN，跳过。", flush=True)
+
+    # ==================== 第四阶段：API 确认 + 拿真实落地 ====================
+    api_results = []      # [(ip, port, country)]
+    if final_items and CHECK_API and CHECK_API.strip():
+        uniq = sorted(set(final_items),
+                      key=lambda x: (ipaddress.ip_address(x[0]), x[1]))
+        print(f"\n[4/4 API 确认] 校验 {len(uniq)} 个"
+              f"（并发={API_CONCURRENCY} 超时={API_TIMEOUT}s "
+              f"重试={API_RETRY}）...", flush=True)
+        api_sem = asyncio.Semaphore(API_CONCURRENCY)
+        async with aiohttp.ClientSession() as session:
+            a_res = await asyncio.gather(
+                *[api_verify(session, ip, p, api_sem) for ip, p in uniq]
+            )
+        ok_n = dead_n = err_n = 0
+        for (ip, port), (st, country) in zip(uniq, a_res):
+            if st == "ok":
+                api_results.append((ip, port, country))
+                ok_n += 1
+            elif st == "error":
+                # API 没答上来 → 仍收录但 country 留占位，等 recheck 补
+                api_results.append((ip, port, "??"))
+                err_n += 1
+            else:
+                dead_n += 1      # API 明确说不通 → 丢弃
+        print(f"[+] API 确认: 通过 {ok_n} | 不通(丢弃) {dead_n} | "
+              f"异常(收录待复验) {err_n}", flush=True)
+    else:
+        api_results = [(ip, port, "??") for ip, port in
+                       sorted(set(final_items),
+                              key=lambda x: (ipaddress.ip_address(x[0]), x[1]))]
+        print("[4/4] 未配置 CHECK_API，country 留 ?? 待 recheck 填。", flush=True)
 
     # ==================== 结果输出（追加去重 + 防覆盖保护） ====================
     output_filename = f"{name_label}.txt"
 
-    if not final_items:
+    if not api_results:
         with open("count.txt", "w") as f:
             f.write("0")
         print("\n==================== 扫描结束 ====================", flush=True)
@@ -659,8 +743,7 @@ async def main():
     old_count = len(old_lines)
 
     new_count = 0
-    for ip, port in final_items:
-        country = get_country(ip)
+    for ip, port, country in api_results:
         line = f"{ip}:{port}#{country} {name_label}"
         if line not in old_lines:
             new_count += 1
