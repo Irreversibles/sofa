@@ -65,7 +65,37 @@ jobs:
             for i in 1 2 3 4 5; do
               git push && break
               echo "push 冲突，第 $i 次重试..."
-              git pull --rebase --autostash || exit 1
+              if ! git pull --rebase origin main; then
+                # rebase 冲突处理：
+                #   .txt 结果文件是行集合、顺序无关，sort -u 取并集是安全的
+                #   （冲突通常来自 recheck 同时在刷 country / 剔除失效条目）
+                #   其他类型文件排序会破坏结构 → 放弃本次 rebase
+                CONFLICTS=$(git diff --name-only --diff-filter=U)
+                ABORT=0
+                if [ -n "$CONFLICTS" ]; then
+                  for f in $CONFLICTS; do
+                    case "$f" in
+                      *.txt)
+                        echo "  合并冲突文件: $f"
+                        sort -u "$f" -o "$f"
+                        git add "$f"
+                        ;;
+                      *)
+                        echo "  非文本文件冲突，放弃本次 rebase: $f"
+                        ABORT=1
+                        break
+                        ;;
+                    esac
+                  done
+                fi
+                if [ "$ABORT" = "1" ]; then
+                  git rebase --abort 2>/dev/null || true
+                elif [ -n "$CONFLICTS" ]; then
+                  GIT_EDITOR=true git rebase --continue || git rebase --abort
+                else
+                  git rebase --abort 2>/dev/null || true
+                fi
+              fi
               sleep $((RANDOM % 10 + 5))
             done
           fi
