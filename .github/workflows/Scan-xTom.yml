@@ -3,7 +3,7 @@ name: Scan xTom (AS3258)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 2'
+    - cron: '0 3 * * 2'   # 每周二 UTC 03:00
 
 concurrency:
   group: scan-xtom
@@ -28,14 +28,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Download GeoIP Database
-        run: |
-          for i in 1 2 3; do
-            curl -L --fail -o GeoLite2-Country.mmdb \
-              https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb && break
-            echo "retry $i..."; sleep 5
-          done
 
       - name: Pull old results
         env:
