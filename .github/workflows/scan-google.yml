@@ -72,7 +72,21 @@ jobs:
             for i in 1 2 3 4 5; do
               git push && break
               echo "push 冲突，第 $i 次重试..."
-              git pull --rebase --autostash || exit 1
+              if ! git pull --rebase origin main; then
+                # rebase 冲突：结果文件是行集合、顺序无关，取并集即可。
+                # 冲突通常来自 recheck 同时在刷 country / 剔除失效条目。
+                CONFLICTS=$(git diff --name-only --diff-filter=U)
+                if [ -n "$CONFLICTS" ]; then
+                  for f in $CONFLICTS; do
+                    echo "  合并冲突文件: $f"
+                    sort -u "$f" -o "$f"
+                    git add "$f"
+                  done
+                  GIT_EDITOR=true git rebase --continue || git rebase --abort
+                else
+                  git rebase --abort 2>/dev/null || true
+                fi
+              fi
               sleep $((RANDOM % 10 + 5))
             done
           fi
