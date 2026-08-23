@@ -1,0 +1,129 @@
+name: Scan Tencent (masscan)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ports:
+        description: '端口（逗号分隔，如 443,8443）'
+        required: false
+        default: '443,8443'
+      masscan_rate:
+        description: 'masscan 发包速率 pps。云厂商（腾讯/阿里/谷歌）5000-10000 安全；防护型商家（如 IT7）降到 1000 以下或别用 masscan'
+        required: false
+        default: '5000'
+      masscan_retries:
+        description: 'masscan 重传次数。每端口发 1+N 次 SYN，越大漏报越少，耗时约 ×(1+N)。建议 2'
+        required: false
+        default: '2'
+      masscan_wait:
+        description: '扫完等待收尾包的秒数。设 0 会丢掉最后几秒的响应，建议 5'
+        required: false
+        default: '5'
+      tls_conc:
+        description: 'TLS 三阶段并发数（默认 300）'
+        required: false
+        default: '300'
+
+concurrency:
+  group: scan-tencent-masscan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install masscan & Python deps
+        run: |
+          echo "[*] 安装 masscan 和依赖..."
+          sudo apt-get update -y > /dev/null
+          sudo apt-get install -y masscan > /dev/null
+          # 打印版本确认安装成功，装失败会在这一步就暴露
+          masscan --version | head -1
+          python -m pip install --upgrade pip -q
+          pip install -r requirements.txt -q
+          echo "[+] 环境就绪"
+
+      - name: Pull old results
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          # 只拷自己的结果文件，避免 push 时把别的任务的旧副本推回去
+          cp result_repo/Tencent.txt ./ 2>/dev/null || true
+
+      - name: Run Scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          MASSCAN_RATE: ${{ inputs.masscan_rate || '5000' }}
+          MASSCAN_RETRIES: ${{ inputs.masscan_retries || '2' }}
+          MASSCAN_WAIT: ${{ inputs.masscan_wait || '5' }}
+          TLS_CONC: ${{ inputs.tls_conc || '300' }}
+        run: |
+          ulimit -n 65535
+          python check_cf_asn_masscan.py "132203" "Tencent" "${{ inputs.ports || '443,8443' }}"
+
+      - name: Cleanup temp files
+        if: always()
+        run: |
+          # 带 always()：即使扫描失败也清理，避免 .tmp 里的大 JSON 被后续步骤误提交
+          rm -rf .tmp
+
+      - name: Push result to private repo
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          if [ ! -s Tencent.txt ]; then
+            echo "Tencent.txt 不存在或为空，本次无结果，跳过推送"
+            exit 0
+          fi
+          cp Tencent.txt result_repo/
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Tencent.txt || true
+
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "auto: update Tencent (masscan)"
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push 冲突，第 $i 次重试..."
+              git pull --rebase --autostash || exit 1
+              sleep $((RANDOM % 10 + 5))
+            done
+          fi
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          PORTS="${{ inputs.ports || '443,8443' }}"
+          RATE="${{ inputs.masscan_rate || '5000' }}"
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ masscan 扫描完成%0A服务商: Tencent%0AASN: 132203%0A端口: ${PORTS}%0Arate: ${RATE}pps%0A本次新增: ${COUNT} 个"
+          else
+            MSG="❌ masscan 扫描失败%0A服务商: Tencent%0A状态: ${{ job.status }}"
+          fi
+          echo "发送内容: ${MSG}"
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}")
+          echo "$RESP"
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
