@@ -41,20 +41,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download GeoIP Database
-        run: |
-          for i in 1 2 3; do
-            curl -L --fail -o GeoLite2-Country.mmdb \
-              https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb && break
-            echo "retry $i..."; sleep 5
-          done
-
       - name: Pull old results
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          # 只拷结果文件，避免把私库里的 requirements.txt 覆盖到本地
+          # 拉所有结果文件：手动扫描的 name_label 可能是 auto，
+          # 此刻还不知道最终文件名，所以只能全拉。
+          # push 阶段会用 name.txt 精确指定推哪个，不会误推别的。
           shopt -s nullglob
           for f in result_repo/*.txt; do
             fn=$(basename "$f")
