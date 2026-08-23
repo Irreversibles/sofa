@@ -23,6 +23,11 @@ on:
         description: 'TLS 三阶段并发数（默认 300）'
         required: false
         default: '300'
+  schedule:
+    # 周一、周四 UTC 10:00 —— 北京 18:00，间隔 3/4 天。
+    # 单轮实测 48 分钟（424万目标、5000pps、retries2），双端口一次扫完，
+    # 取代了原先拆成 443 / 8443 两个 workflow 的做法。
+    - cron: '0 10 * * 1,4'
 
 concurrency:
   group: scan-tencent-masscan
