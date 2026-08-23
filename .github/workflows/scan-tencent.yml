@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # 周一、周四 UTC 10:00 —— 北京 18:00，间隔3/4天
-    - cron: '0 10 * * 1,4'
+    #- cron: '0 10 * * 1,4'
 
 concurrency:
   group: scan-tencent-full443
