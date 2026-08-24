@@ -167,6 +167,7 @@ jobs:
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
           MASK_PORT_LOG: "1"
+          CHECK_API: ${{ secrets.CHECK_API }}
         run: |
           echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT}"
           python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
