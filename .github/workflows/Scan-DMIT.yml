@@ -129,7 +129,6 @@ jobs:
           selected, next_cursor = select_batch(extra_pool, cursor, max_extra)
           sel_sig = hashlib.sha1(",".join(map(str, selected)).encode()).hexdigest() if selected else ""
 
-          # 防连续重复：若与上次完全一样，强制再跳一段重选
           if selected and sel_sig == prev_sig and len(extra_pool) > len(selected):
               jump_start = (next_cursor + max(1, len(selected))) % len(extra_pool)
               selected, next_cursor = select_batch(extra_pool, jump_start, max_extra)
@@ -167,6 +166,7 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          MASK_PORT_LOG: "1"
         run: |
           echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT}"
           python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
