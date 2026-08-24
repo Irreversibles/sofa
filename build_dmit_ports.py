@@ -2,17 +2,14 @@
 """
 决定本轮扫哪些端口、以及本轮到底跑不跑。
 
-配额：按时间预算反推，池子变大时每轮端口数不缩水。
-节奏：按"轮转一圈需要几轮(cycle)"自适应——
-    cycle == 1（池子 ≤ 配额，一轮扫全）      → 隔 3 天，避免每天重扫同一批
-    cycle 2-3                                → 隔 2 天
-    cycle >= 4（池子远大于配额）             → 每天，尽快转完一圈
-判据用 cycle 而非池子大小：一轮能不能扫全取决于池子/配额的比值，
-而配额随 IP 数变，所以 cycle 才是真正自适应的量。
+配额：按时间预算反推，用实测吞吐(EMA)自校准 —— 吞吐骤降/IP暴增时
+      配额自动收缩，配合 check_cf_asn.py 的硬时间闸门，双保险不超时。
+节奏：按 cycle（轮转一圈需要几轮）自适应。
+截断：被闸门截断而没扫全的端口不标记已扫，下轮自动优先补。
 
 模式：
     默认        选端口 + 决策 SHOULD_RUN，写进 GITHUB_ENV
-    --finalize  扫描成功后调用，标记已扫 + 记录本轮扫描时刻
+    --finalize  扫描后调用，标记真正扫完的端口 + EMA 更新吞吐 + 记录时刻
 """
 import ipaddress
 import json
@@ -29,18 +26,24 @@ ASN = os.environ.get("ASN", "906").replace("AS", "").strip()
 DEFAULT_PORTS = os.environ.get("DEFAULT_PORTS", "443,8443,2053,2083,2096")
 
 SCAN_BUDGET_MIN = float(os.environ.get("SCAN_BUDGET_MIN", "170"))
-TCP_THROUGHPUT = float(os.environ.get("TCP_THROUGHPUT", "28000"))
+# 初始/回退吞吐：还没有实测 EMA 时用它，取保守值宁可第一轮少扫
+TCP_THROUGHPUT_INIT = float(os.environ.get("TCP_THROUGHPUT", "22000"))
+# 安全系数：配额按 EMA×这个算，给吞吐波动留余量
+THROUGHPUT_SAFETY = float(os.environ.get("THROUGHPUT_SAFETY", "0.85"))
+EMA_ALPHA = float(os.environ.get("EMA_ALPHA", "0.5"))
 PORTS_MIN_TOTAL = int(os.environ.get("PORTS_MIN_TOTAL", "10"))
 PORTS_MAX_TOTAL = int(os.environ.get("PORTS_MAX_TOTAL", "80"))
 
 HOT_MIN_COUNT = int(os.environ.get("HOT_MIN_COUNT", "5"))
 HOT_SHARE = float(os.environ.get("HOT_SHARE", "0.5"))
 
-# 节奏档位：cycle -> 最小间隔天数
 CADENCE_1 = int(os.environ.get("CADENCE_CYCLE1_DAYS", "3"))
 CADENCE_2 = int(os.environ.get("CADENCE_CYCLE2_DAYS", "2"))
 CADENCE_4 = int(os.environ.get("CADENCE_CYCLE4_DAYS", "1"))
 FORCE_RUN = os.environ.get("FORCE_RUN", "0") == "1"
+
+DONE_FILE = os.environ.get("SCAN_DONE_FILE", "scan_done_ports.txt")
+METRICS_FILE = os.environ.get("SCAN_METRICS_FILE", "scan_metrics.json")
 
 FETCH_TIMEOUT = 15
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -121,20 +124,54 @@ def interval_for_cycle(cycle):
     return CADENCE_4
 
 
+def _read_done_ports():
+    try:
+        with open(DONE_FILE, "r", encoding="utf-8") as f:
+            return [int(x) for x in f.read().split() if x.isdigit()]
+    except Exception:
+        return None       # 文件不存在 = 没启用闸门 = 全部选中都算扫完
+
+
+def _read_metrics():
+    try:
+        with open(METRICS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def finalize():
     st = load_state(STATE_FILE)
-    pend = [int(p) for p in st.get("pending_selected", []) if str(p).isdigit()]
     ts = now_ts()
+
+    # --- 只标记"真正扫完"的端口，被截断的保持旧 last_scanned 以便下轮优先 ---
+    done = _read_done_ports()
+    pend = [int(p) for p in st.get("pending_selected", []) if str(p).isdigit()]
+    mark = pend if done is None else [p for p in pend if p in set(done)]
     n = 0
-    for p in pend:
+    for p in mark:
         rec = st["ports"].get(str(p))
         if rec is not None:
             rec["last_scanned"] = ts
             n += 1
+    skipped = len(pend) - len(mark)
+
+    # --- EMA 自校准吞吐（截断与否，实测速度都真实有效）---
+    m = _read_metrics()
+    measured = float(m.get("tcp_throughput_per_min", 0) or 0)
+    if measured > 0:
+        prev = float(st.get("throughput_ema", 0) or 0)
+        new_ema = measured if prev <= 0 else EMA_ALPHA * measured + (1 - EMA_ALPHA) * prev
+        st["throughput_ema"] = round(new_ema, 1)
+        print(f"[OK] 吞吐 EMA: {prev:,.0f} + 实测 {measured:,.0f} "
+              f"-> {new_ema:,.0f} 目标/分钟", flush=True)
+
     st["pending_selected"] = []
-    st["last_scan_ts"] = ts          # 供下轮 cadence 判定
+    st["last_scan_ts"] = ts
     save_state(STATE_FILE, st)
-    print(f"[OK] finalize: {n} 个端口标记为已扫，last_scan_ts={ts}", flush=True)
+    print(f"[OK] finalize: 标记已扫 {n} 个"
+          f"{f'，截断未扫 {skipped} 个（下轮优先补）' if skipped else ''}，"
+          f"last_scan_ts={ts}", flush=True)
 
 
 def main():
@@ -164,11 +201,20 @@ def main():
         src = "兜底估值"
     print(f"[*] AS{ASN} IP 数: {ip_count:,}（{src}）", flush=True)
 
-    budget_targets = SCAN_BUDGET_MIN * TCP_THROUGHPUT
+    # --- 吞吐：优先用实测 EMA，没有则用保守初值 ---
+    ema = float(st.get("throughput_ema", 0) or 0)
+    if ema > 0:
+        thr = ema * THROUGHPUT_SAFETY
+        thr_src = f"EMA {ema:,.0f}×{THROUGHPUT_SAFETY}"
+    else:
+        thr = TCP_THROUGHPUT_INIT * THROUGHPUT_SAFETY
+        thr_src = f"初值 {TCP_THROUGHPUT_INIT:,.0f}×{THROUGHPUT_SAFETY}"
+
+    budget_targets = SCAN_BUDGET_MIN * thr
     raw_total = int(budget_targets // max(1, ip_count))
     total_ports = max(PORTS_MIN_TOTAL, min(PORTS_MAX_TOTAL, raw_total))
-    print(f"[*] 预算 {SCAN_BUDGET_MIN:.0f}min × {TCP_THROUGHPUT:,.0f}/min "
-          f"= {budget_targets:,.0f} 目标 → 配额 {raw_total} "
+    print(f"[*] 预算 {SCAN_BUDGET_MIN:.0f}min × {thr:,.0f}/min（{thr_src}）"
+          f" = {budget_targets:,.0f} 目标 → 配额 {raw_total} "
           f"（夹到 [{PORTS_MIN_TOTAL},{PORTS_MAX_TOTAL}] → {total_ports}）",
           flush=True)
 
@@ -193,7 +239,6 @@ def main():
     st["pending_selected"] = selected
     save_state(STATE_FILE, st)
 
-    # ---- 节奏决策 ----
     cycle = math.ceil(len(pool) / max(1, len(rotate_sel))) if rotate_sel else 1
     interval = interval_for_cycle(cycle)
     last_scan_ts = int(st.get("last_scan_ts", 0) or 0)
@@ -209,8 +254,9 @@ def main():
         should_run = False
         reason = f"距上次 {elapsed_days:.1f}d < 间隔 {interval}d"
 
-    est_targets = ip_count * len(merged)
-    est_min = est_targets / TCP_THROUGHPUT
+    # 预计耗时用真实 EMA（不带安全系数），更贴近实际
+    real_thr = ema if ema > 0 else TCP_THROUGHPUT_INIT
+    est_min = (ip_count * len(merged)) / real_thr
 
     print(f"[*] 档案 {len(ports)} 端口（可轮转 {len(pool)}，"
           f"频次≥{HOT_MIN_COUNT} 的 {len(hot_all)}）", flush=True)
@@ -218,7 +264,7 @@ def main():
           f"+ 轮转 {len(rotate_sel)} = {len(merged)} 端口", flush=True)
     print(f"[*] 轮转一圈 {cycle} 轮 → 间隔 {interval} 天 | {reason} "
           f"→ SHOULD_RUN={should_run}", flush=True)
-    print(f"[*] 预计 {est_targets:,} 目标 / TCP 约 {est_min:.0f} 分钟", flush=True)
+    print(f"[*] 预计 {ip_count * len(merged):,} 目标 / 约 {est_min:.0f} 分钟", flush=True)
 
     write_env({
         "SHOULD_RUN": "true" if should_run else "false",
