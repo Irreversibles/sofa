@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 dmit_ports_pool.txt
 dmit_ports_state.json
+SCHEDULE.md
