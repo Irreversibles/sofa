@@ -1,60 +1,30 @@
 #!/usr/bin/env python3
 """
-从 TG 群收集 DMIT(AS906) 的端口，累积成端口池。
+从 TG 群收集 DMIT(AS906) 端口，累积成带频次的端口档案。
 
-state 文件是多方共写的：本脚本负责 last_msg_id / ports，
-workflow 的轮转逻辑负责 extra_cursor / last_selected_sig 等。
-所以读的时候必须原样保留全部字段，写的时候只覆盖自己那两个 ——
-否则会擦掉轮转游标，导致每轮都从池子开头选同一批端口。
+频次是价值信号：同一端口被发布多次说明多个客户在用，命中概率更高，
+所以档案记 count，由 build_dmit_ports.py 用来做优先级。
 """
 import os
 import re
-import json
 import asyncio
 
 from telethon import TelegramClient
 
-# ========= 环境变量 =========
+from port_state import load_state, save_state, now_ts
+
 TG_API_ID = int(os.environ["TG_API_ID"])
 TG_API_HASH = os.environ["TG_API_HASH"]
-TG_SOURCE_CHAT = os.environ["TG_SOURCE_CHAT"]   # @group 或 -100xxxx
+TG_SOURCE_CHAT = os.environ["TG_SOURCE_CHAT"]        # @group 或 -100xxxx
 TG_FETCH_LIMIT = int(os.environ.get("TG_FETCH_LIMIT", "5000"))
-
-# 可选：session base64（CI 里无法交互输验证码，必须预先注入）
 TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "")
 
 STATE_FILE = os.environ.get("STATE_FILE", "dmit_ports_state.json")
 OUT_FILE = os.environ.get("OUT_FILE", "dmit_ports_pool.txt")
-# ==========================
 
 IP_RE = re.compile(r"IP地址\s*[:：]\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})")
 PORT_RE = re.compile(r"端口\s*[:：]\s*(\d{1,5})")
 ASN_RE = re.compile(r"ASN编号\s*[:：]\s*(.+)", re.IGNORECASE)
-
-
-def load_state():
-    """原样返回整个 dict —— 不能只挑自己关心的字段，否则回写时
-    会丢掉 workflow 维护的 extra_cursor / last_selected_sig。"""
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_state_atomic(state: dict, last_msg_id: int, ports: set):
-    """只更新本脚本负责的两个字段，其余原样保留。"""
-    state = dict(state or {})
-    state["last_msg_id"] = int(last_msg_id)
-    state["ports"] = sorted(ports)
-
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
 
 
 def is_dmit_message(text: str) -> bool:
@@ -85,9 +55,9 @@ def extract_port_from_msg(text: str):
 
 
 async def main():
-    st = load_state()
+    st = load_state(STATE_FILE)
     last_msg_id = int(st.get("last_msg_id", 0) or 0)
-    port_pool = {int(x) for x in st.get("ports", []) if str(x).isdigit()}
+    ports = st["ports"]
 
     session_name = "tg_dmit_ports"
     if TG_SESSION_B64:
@@ -110,7 +80,9 @@ async def main():
         raise
 
     newest_msg_id = last_msg_id
-    newly_found = set()
+    new_ports = 0
+    hit_msgs = 0
+    ts = now_ts()
 
     kwargs = {"limit": TG_FETCH_LIMIT}
     if last_msg_id > 0:
@@ -122,24 +94,33 @@ async def main():
         if not msg.message:
             continue
         p = extract_port_from_msg(msg.message)
-        if p is not None:
-            if p not in port_pool:
-                newly_found.add(p)
-            port_pool.add(p)
+        if p is None:
+            continue
+        hit_msgs += 1
+        key = str(p)
+        rec = ports.get(key)
+        if rec is None:
+            ports[key] = {"count": 1, "first_seen": ts,
+                          "last_seen": ts, "last_scanned": 0}
+            new_ports += 1
+        else:
+            rec["count"] = int(rec.get("count", 1) or 1) + 1
+            rec["last_seen"] = ts
 
     await client.disconnect()
 
+    st["last_msg_id"] = int(newest_msg_id)
+    save_state(STATE_FILE, st)
+
+    # 可读产物：端口 频次（build 不依赖它，只读 state）
     with open(OUT_FILE, "w", encoding="utf-8", newline="\n") as f:
-        for p in sorted(port_pool):
-            f.write(str(p) + "\n")
+        for k in sorted(ports, key=lambda x: int(x)):
+            f.write(f"{k} {ports[k].get('count', 1)}\n")
 
-    save_state_atomic(st, newest_msg_id, port_pool)
-
-    print(f"[OK] last_msg_id(old)={last_msg_id}, last_msg_id(new)={newest_msg_id}")
-    print(f"[OK] total_ports={len(port_pool)}")
-    print(f"[OK] newly_found_count={len(newly_found)}")
-    print("[OK] state updated")
-    print("[OK] pool updated")
+    hot = sum(1 for v in ports.values() if int(v.get("count", 1) or 1) >= 5)
+    print(f"[OK] last_msg_id: {last_msg_id} -> {newest_msg_id}")
+    print(f"[OK] 本次命中消息 {hit_msgs} 条，新端口 {new_ports} 个")
+    print(f"[OK] 档案总端口 {len(ports)} 个（其中频次≥5 的 {hot} 个）")
 
 
 if __name__ == "__main__":
