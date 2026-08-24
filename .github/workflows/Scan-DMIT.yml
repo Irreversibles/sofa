@@ -1,9 +1,9 @@
-name: Scan DMIT (AS906 budget-driven ports)
+name: Scan DMIT (AS906 budget-driven + cycle cadence)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '20 2 * * *'
+    - cron: '20 2 * * *'   # 每天触发，是否执行由 build 步骤的 SHOULD_RUN 决定
 
 concurrency:
   group: scan-dmit
@@ -39,6 +39,7 @@ jobs:
           cp result_repo/DMIT.txt ./ 2>/dev/null || true
           cp result_repo/dmit_ports_state.json ./ 2>/dev/null || true
 
+      # 收集无条件执行：即使今天不扫，也要保住新端口和 last_msg_id
       - name: Collect DMIT ports from TG
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -50,7 +51,8 @@ jobs:
           OUT_FILE: "dmit_ports_pool.txt"
         run: python collect_dmit_ports.py
 
-      - name: Build port list for this round
+      # 选端口 + 决策 SHOULD_RUN（手动触发时强制跑）
+      - name: Build port list + cadence decision
         env:
           STATE_FILE: "dmit_ports_state.json"
           ASN: "906"
@@ -61,10 +63,15 @@ jobs:
           PORTS_MAX_TOTAL: "80"
           HOT_MIN_COUNT: "5"
           HOT_SHARE: "0.5"
+          CADENCE_CYCLE1_DAYS: "3"
+          CADENCE_CYCLE2_DAYS: "2"
+          CADENCE_CYCLE4_DAYS: "1"
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python build_dmit_ports.py
 
       - name: Run Scan
         id: scan
+        if: env.SHOULD_RUN == 'true'
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
           CHECK_API: ${{ secrets.CHECK_API }}
@@ -73,14 +80,14 @@ jobs:
           echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
           python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
 
-      # 只有扫成功才把本轮端口标记为已扫，否则它们会被延后整整一圈
+      # 只有真正扫成功才推进轮转 + 记录扫描时刻
       - name: Finalize port rotation
-        if: steps.scan.outcome == 'success'
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
           STATE_FILE: "dmit_ports_state.json"
         run: python build_dmit_ports.py --finalize
 
-      # state 无条件推送：即使扫描失败，收集到的新端口和 last_msg_id 也要保住
+      # state 无条件推送：跳过扫描也要保住收集成果和轮转进度
       - name: Push port state (always)
         if: always()
         env:
@@ -106,8 +113,6 @@ jobs:
           for i in 1 2 3 4 5; do
             git push && break
             echo "state push 冲突，第 $i 次重试..."
-            # state 只有本 workflow 写，冲突几乎只可能是自己重跑；
-            # rebase 语境下 --theirs 才是正在重放的本次提交
             if ! git pull --rebase origin main; then
               CONFLICTS=$(git diff --name-only --diff-filter=U)
               if [ -n "$CONFLICTS" ]; then
@@ -127,7 +132,7 @@ jobs:
           done
 
       - name: Push DMIT result
-        if: steps.scan.outcome == 'success'
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
@@ -185,8 +190,10 @@ jobs:
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
           if [ "${{ job.status }}" != "success" ]; then
             MSG="❌ 扫描失败%0A服务商: DMIT (AS906)%0A状态: ${{ job.status }}"
+          elif [ "${SHOULD_RUN:-false}" != "true" ]; then
+            MSG="⏭️ 本次跳过%0A服务商: DMIT (AS906)%0A端口档案: ${POOL_COUNT:-?}%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天"
           else
-            MSG="✅ 扫描完成%0A服务商: DMIT (AS906)%0A端口: ${MERGED_PORTS_COUNT:-?} 个（高频 ${HOT_COUNT:-?} + 轮转 ${ROTATE_COUNT:-?}）%0A端口档案: ${POOL_COUNT:-?}%0A轮转一圈: ${CYCLE_ROUNDS:-?} 轮%0A本次新增: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: DMIT (AS906)%0A端口: ${MERGED_PORTS_COUNT:-?}（高频 ${HOT_COUNT:-?} + 轮转 ${ROTATE_COUNT:-?}）%0A档案: ${POOL_COUNT:-?}%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天%0A本次新增: ${COUNT} 个"
           fi
 
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
