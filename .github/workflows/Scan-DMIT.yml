@@ -1,9 +1,9 @@
-name: Scan DMIT (AS906 adaptive stable)
+name: Scan DMIT (AS906 adaptive stable + adaptive cadence)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 */3 * *'   # 每3天 UTC 03:00
+    - cron: '0 3 * * *'   # 每天 UTC 03:00，是否执行由运行时闸门决定
 
 concurrency:
   group: scan-dmit
@@ -54,7 +54,39 @@ jobs:
           python collect_dmit_ports.py
           echo "[INFO] pool_count=$(wc -l < dmit_ports_pool.txt || echo 0)"
 
+      - name: Decide adaptive cadence
+        run: |
+          POOL_COUNT=$(wc -l < dmit_ports_pool.txt 2>/dev/null || echo 0)
+
+          # 可按需调整阈值
+          # <=80   -> 每3天
+          # 81-300 -> 每2天
+          # >300   -> 每1天
+          if [ "$POOL_COUNT" -le 80 ]; then
+            INTERVAL=3
+          elif [ "$POOL_COUNT" -le 300 ]; then
+            INTERVAL=2
+          else
+            INTERVAL=1
+          fi
+
+          DAY_NUM=$(( $(date -u +%s) / 86400 ))
+          if [ $((DAY_NUM % INTERVAL)) -eq 0 ]; then
+            SHOULD_RUN=true
+          else
+            SHOULD_RUN=false
+          fi
+
+          echo "POOL_COUNT=$POOL_COUNT" >> "$GITHUB_ENV"
+          echo "ADAPTIVE_INTERVAL=$INTERVAL" >> "$GITHUB_ENV"
+          echo "SHOULD_RUN=$SHOULD_RUN" >> "$GITHUB_ENV"
+
+          echo "[INFO] cadence_pool_count=$POOL_COUNT"
+          echo "[INFO] cadence_interval_days=$INTERVAL"
+          echo "[INFO] cadence_should_run=$SHOULD_RUN"
+
       - name: Build adaptive merged ports (rotate + anti-repeat, masked)
+        if: env.SHOULD_RUN == 'true'
         env:
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           EXTRA_SMALL: "50"
@@ -164,15 +196,17 @@ jobs:
           PY
 
       - name: Run Scan
+        if: env.SHOULD_RUN == 'true'
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-          MASK_PORT_LOG: "1"
           CHECK_API: ${{ secrets.CHECK_API }}
+          MASK_PORT_LOG: "1"
         run: |
           echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT}"
           python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
 
       - name: Push DMIT result + private port state
+        if: env.SHOULD_RUN == 'true'
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
@@ -243,9 +277,13 @@ jobs:
           EX_POOL="${EXTRA_POOL_COUNT:-?}"
           EX_SEL="${EXTRA_SELECTED_COUNT:-?}"
           EX_MAX="${ADAPTIVE_MAX_EXTRA:-?}"
+          CAD_POOL="${POOL_COUNT:-?}"
+          CAD_INT="${ADAPTIVE_INTERVAL:-?}"
 
-          if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A端口总数: ${PCOUNT}%0A高位池: ${EX_POOL}%0A本次高位: ${EX_SEL}(上限${EX_MAX})%0A本次新增: ${COUNT} 个"
+          if [ "${SHOULD_RUN:-false}" != "true" ]; then
+            MSG="⏭️ 本次跳过%0A服务商: DMIT%0A高位池: ${CAD_POOL}%0A策略频率: 每${CAD_INT}天"
+          elif [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A端口总数: ${PCOUNT}%0A高位池: ${EX_POOL}%0A本次高位: ${EX_SEL}(上限${EX_MAX})%0A策略频率: 每${CAD_INT}天%0A本次新增: ${COUNT} 个"
           else
             MSG="❌ 扫描失败%0A服务商: DMIT%0A目标: AS906%0A状态: ${{ job.status }}"
           fi
@@ -253,6 +291,7 @@ jobs:
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT_ID }} \
             -d text="${MSG}")
+
           case "$RESP" in
             *'"ok":true'*) : ;;
             *) echo "::error::TG 推送失败" ;;
