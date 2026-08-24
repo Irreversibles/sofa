@@ -3,6 +3,7 @@ import ssl
 import sys
 import os
 import re
+import time
 import resource
 import json
 import ipaddress
@@ -56,6 +57,17 @@ DEFAULT_PORTS = os.getenv("PORTS", "443,8443,2053,2083,2096")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 MASK_PORT_LOG = os.getenv("MASK_PORT_LOG", "0") == "1"
 
+# ==================== 硬时间闸门 ====================
+# 无论配额估得多离谱（吞吐骤降 / IP 暴增 / runner 变慢），进程都在这个
+# 墙钟预算内优雅收尾，绝不被 GitHub 的 350 分钟上限强杀。
+#   TCP 阶段跑到预算 70% 就停止扫剩余目标，用已探活结果继续
+#   TLS 阶段跑到预算 95% 就停，写出已有结果
+# 被截断而未完整覆盖的端口不会写进 scan_done_ports.txt，下轮自动优先补。
+# 设为 0（默认）= 关闭闸门，行为与旧版完全一致。
+SCAN_DEADLINE_MIN = float(os.getenv("SCAN_DEADLINE_MIN", "0"))
+TCP_BUDGET_FRAC = float(os.getenv("TCP_BUDGET_FRAC", "0.70"))
+TLS_BUDGET_FRAC = float(os.getenv("TLS_BUDGET_FRAC", "0.95"))
+
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
@@ -64,18 +76,6 @@ CF_HOST_TEST = "crypto.cloudflare.com"
 ASN_FETCH_TIMEOUT = 15    # 大 ASN 的 prefix 列表 JSON 很大，超时给足
 
 # ==================== 按 ASN 的策略档案 ====================
-# 某些服务商（尤其 DDoS 防护类）对高并发 SYN 有扫描检测：TCP 预筛会让
-# 本机在 TLS 阶段开始前就被限速，结果暴跌。在这里登记一次，以后扫这个
-# ASN 自动套用，不必每次记参数。环境变量可临时覆盖。
-#
-# 可用字段：name / tcp_stage / tcp_conc / tls_conc / tls_retry / stage1_timeout
-# name 用于固定文件名 —— auto 模式按 API 返回的 holder 名推导，同一 ASN
-# 可能得到不同别名而写进多个文件（IT7 / IT7NET 就是这么分家的）。
-#
-# 实测记录（AS25820，409,128 IP × 443）：
-#   预筛开(2500并发)              → 探活7,341 → 一阶段71  → 有效7
-#   预筛关(TLS 200, retry1, 3s)   → 40,000个跑了33分钟，全程需337分钟，会超时
-#   预筛关(TLS 200, retry0, 2s)   → 约51-68分钟（与原版一致），一阶段约1,700
 ASN_PROFILES = {
     "25820": {                       # IT7NET - IT7 Networks
         "name": "IT7",
@@ -96,24 +96,19 @@ TCP_BATCH_MIN = 50000
 TCP_BATCH_MAX = 500000
 
 # 黑洞 IP 过滤：仅在端口数足够多时有意义
-# （只扫 5 个端口时，一台正常 CF 前置主机同时开 443/2053/2083/2096 是合理的，
-#   无法据此判定异常，故自动跳过）
 BLACKHOLE_MIN_PORTS = 10
 BLACKHOLE_RATIO = 0.05
 BLACKHOLE_MIN = 20
 
 # 三阶段 TLS 校验
 TLS_CONCURRENCY = 300
-TLS_CHUNK = 20000         # 分块打印进度，避免大批量时日志长时间静默
+TLS_CHUNK = 20000
 STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
-TLS_RETRY = 1             # 仅"握手未完成"重试，"明确不符"立即放弃
+TLS_RETRY = 1
 
 # ==================== 第四阶段：自建 API 确认落地 ====================
-# 三阶段只证明"TLS 能透传到 CF 边缘"，不证明"能作为 proxyip 转发"。
-# 这一步用自建 Worker 实测转发并拿真实落地国家 —— GeoIP 给的是 IP 注册地，
-# 与落地常不一致（云厂商尤其明显），所以 country 只认这里的结果。
 CHECK_API = os.getenv("CHECK_API", "").strip()
 API_CONCURRENCY = int(os.getenv("API_CONC", "20"))
 API_TIMEOUT = 30
@@ -178,8 +173,6 @@ def apply_asn_profile(asn_clean):
 
 
 def get_country(ip):
-    """GeoIP 查的是 IP 注册地，仅在 API 不可用时作兜底参考。
-    真实落地由第四阶段的自建 API 提供。"""
     if geo_reader is None:
         return "??"
     try:
@@ -189,7 +182,6 @@ def get_country(ip):
 
 
 def pick_ports(port_str):
-    """按填写的端口解析（逗号/空格分隔），无有效值则用默认。"""
     if not port_str:
         return [443, 8443, 2053, 2083, 2096]
     ports = set()
@@ -244,7 +236,6 @@ def simplify_name(full_name):
 
 
 def _safe_filename(name):
-    """净化成安全的文件名：ASN 注册名可能含 / 等特殊字符，会导致路径非法"""
     cleaned = re.sub(r'[^\w.-]', '_', name).strip('._')
     return cleaned or "RESULT"
 
@@ -359,7 +350,6 @@ def match_domain_in_cert(sni_domain, cert_str):
 
 
 async def tcp_alive(ip, port, sem):
-    """纯 TCP 握手。失败时带退避重试 —— 被限速丢的 SYN 立刻重连仍会失败"""
     async with sem:
         for attempt in range(TCP_RETRY + 1):
             writer = None
@@ -383,7 +373,6 @@ async def tcp_alive(ip, port, sem):
 
 
 async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
-    """True=证书匹配 / False=明确不匹配 / None=握手未完成（可重试）"""
     async with sem:
         writer = None
         try:
@@ -412,7 +401,6 @@ async def check_tls_sni_async(ip, port, sni, timeout_val, sem):
 
 
 async def check_http_async(ip, port, host, timeout_val, sem):
-    """True=拿到301/302 / False=拿到响应但不符 / None=没拿到响应（可重试）"""
     async with sem:
         writer = None
         try:
@@ -443,7 +431,6 @@ async def check_http_async(ip, port, host, timeout_val, sem):
 
 
 async def retry_check(fn, ip, port, arg, timeout_val, sem):
-    """三态重试：None（握手未完成）才重试，False（明确不符）立即返回"""
     for attempt in range(TLS_RETRY + 1):
         r = await fn(ip, port, arg, timeout_val, sem)
         if r is not None:
@@ -454,12 +441,6 @@ async def retry_check(fn, ip, port, arg, timeout_val, sem):
 
 
 async def api_verify(session, ip, port, sem):
-    """自建 API 确认转发能力 + 拿真实落地国家。
-
-    返回 ("ok", country) / ("dead", "??") / ("error", "??")
-    关键：区分"API 明确说不通"和"API 自己没答上来"。后者归 error，
-    不当作失效 —— 否则 API 抖一下就会丢掉好货。
-    """
     async with sem:
         url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
         for attempt in range(API_RETRY + 1):
@@ -474,7 +455,6 @@ async def api_verify(session, ip, port, sem):
                         return ("error", "??")
                     ctype = (resp.headers.get("content-type") or "").lower()
                     if "json" not in ctype:
-                        # CF 错误页（1027 超额 / 1102 超限）是 text/html
                         if attempt < API_RETRY:
                             await asyncio.sleep(2 * (attempt + 1))
                             continue
@@ -501,18 +481,24 @@ async def api_verify(session, ip, port, sem):
         return ("error", "??")
 
 
-async def gather_staged(items, make_coro, label):
-    """分块执行 + 进度打印，避免大批量时日志长时间静默"""
+async def gather_staged(items, make_coro, label, deadline_ts=None):
+    """分块执行 + 进度打印。过 deadline_ts 就停止启动新块并返回 truncated=True。"""
     total = len(items)
     results = []
+    truncated = False
     for i in range(0, total, TLS_CHUNK):
+        if deadline_ts and time.monotonic() > deadline_ts:
+            truncated = True
+            print(f"  [{label}] 触及时间闸门，停止（已处理 {len(results):,}/{total:,}）",
+                  flush=True)
+            break
         part = items[i:i + TLS_CHUNK]
         res = await asyncio.gather(*[make_coro(ip, p) for ip, p in part])
         results.extend(res)
         if total > TLS_CHUNK:
             print(f"  [{label}] {min(i + TLS_CHUNK, total):,}/{total:,} | "
                   f"通过: {sum(1 for x in results if x):,}", flush=True)
-    return results
+    return results, truncated
 
 
 def resolve_name(target_input, name_arg):
@@ -521,9 +507,6 @@ def resolve_name(target_input, name_arg):
     first = target_input.strip().split(",")[0].strip()
     asn_clean = first.upper().replace("AS", "")
     if asn_clean.isdigit():
-        # 档案里登记过固定名字 → 优先用它。
-        # 否则 auto 按 API 返回的 holder 名推导，同一 ASN 可能得到不同别名，
-        # 结果被写进多个文件（IT7 / IT7NET 就是这么分家的）。
         prof_name = ASN_PROFILES.get(asn_clean, {}).get("name")
         if prof_name:
             print(f"[*] AS{asn_clean} 使用档案指定名字: {prof_name}", flush=True)
@@ -554,7 +537,6 @@ async def main():
     with open("name.txt", "w") as f:
         f.write(name_label)
 
-    # 按第一个 ASN 套用策略档案（多 ASN 混扫时以第一个为准）
     first_target = target_input.strip().split(",")[0].strip()
     apply_asn_profile(first_target.upper().replace("AS", ""))
 
@@ -566,9 +548,55 @@ async def main():
 
     print(f"\n[*] 正在解析目标...", flush=True)
     all_ips = await parse_targets_async(target_input)
+
+    # ---- 时间闸门基准 ----
+    scan_start = time.monotonic()
+    deadline_sec = SCAN_DEADLINE_MIN * 60 if SCAN_DEADLINE_MIN > 0 else None
+    tcp_deadline = (scan_start + deadline_sec * TCP_BUDGET_FRAC) if deadline_sec else None
+    tls_deadline = (scan_start + deadline_sec * TLS_BUDGET_FRAC) if deadline_sec else None
+    if deadline_sec:
+        print(f"[*] 时间闸门: 总预算 {SCAN_DEADLINE_MIN:.0f} 分钟"
+              f"（TCP 到 {TCP_BUDGET_FRAC:.0%}={SCAN_DEADLINE_MIN*TCP_BUDGET_FRAC:.0f}min，"
+              f"TLS 到 {TLS_BUDGET_FRAC:.0%}={SCAN_DEADLINE_MIN*TLS_BUDGET_FRAC:.0f}min）",
+              flush=True)
+
+    # 覆盖跟踪：默认全覆盖，TCP 被闸门截断时缩小为已完整探完的端口
+    tcp_covered_ports = list(target_ports)
+    pipeline_truncated = False   # TLS/API 阶段被截断 → 结果不完整，本轮不推进轮转
+    tcp_metrics = {}
+
+    def write_scan_artifacts():
+        """写给 build_dmit_ports.py --finalize 和 yml Notify 用。
+        仅在启用时间闸门时产出，避免污染其它 ASN 的手动扫描。
+          scan_done_ports.txt = 本轮真正扫完、可推进轮转的端口
+          scan_metrics.json   = TCP 实测吞吐，供 EMA 自校准
+          scan_truncated.txt  = 1/0，本轮是否被闸门截断（Notify 读）"""
+        if not deadline_sec:
+            return
+        try:
+            dp = [] if pipeline_truncated else tcp_covered_ports
+            with open("scan_done_ports.txt", "w", encoding="utf-8", newline="\n") as f:
+                for p in dp:
+                    f.write(f"{p}\n")
+        except Exception:
+            pass
+        try:
+            tcp_metrics["pipeline_truncated"] = pipeline_truncated
+            with open("scan_metrics.json", "w", encoding="utf-8") as f:
+                json.dump(tcp_metrics, f)
+        except Exception:
+            pass
+        try:
+            trunc = tcp_metrics.get("truncated") or pipeline_truncated
+            with open("scan_truncated.txt", "w", encoding="utf-8") as f:
+                f.write("1" if trunc else "0")
+        except Exception:
+            pass
+
     if not all_ips:
         with open("count.txt", "w") as f:
             f.write("0")
+        write_scan_artifacts()
         print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
         return
 
@@ -581,15 +609,13 @@ async def main():
 
     # ==================== 阶段零：TCP 探活 ====================
     if TCP_STAGE_ENABLED:
-        print(f"[*] TCP 阶段预估约 {total / (TCP_CONCURRENCY / TCP_TIMEOUT) / 60:.0f} 分钟"
-              f"（分 {(total + tcp_batch - 1) // tcp_batch} 批，每批 {tcp_batch:,}）",
-              flush=True)
         print(f"\n[0/4 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} "
               f"超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
         tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
         open_ports = []
         batch = []
         done = 0
+        tcp_start = time.monotonic()
 
         async def flush_batch(b):
             nonlocal done
@@ -598,30 +624,50 @@ async def main():
             done += len(b)
             print(f"  [探活] {done:,}/{total:,} | 开放: {len(open_ports):,}", flush=True)
 
-        # 端口优先：让同一批并发落在不同 IP 上。
-        # IP 优先（ip1:443, ip1:8443, ip2:443...）会使 2500 并发只覆盖约
-        # 1250 个 IP、每个同时挨 2 个 SYN，更容易触发目标侧扫描检测。
+        # 端口优先（外层端口、内层 IP）：每个端口连续贡献 len(all_ips) 个目标，
+        # 所以被闸门截断时"已完整覆盖端口数 = done // len(all_ips)"精确成立。
+        stop = False
         for port in target_ports:
+            if stop:
+                break
             for ip in all_ips:
                 batch.append((ip, port))
                 if len(batch) >= tcp_batch:
                     await flush_batch(batch)
                     batch = []
-        if batch:
+                    if tcp_deadline and time.monotonic() > tcp_deadline:
+                        stop = True
+                        break
+        if batch and not stop:
             await flush_batch(batch)
 
+        tcp_elapsed = max(1e-6, time.monotonic() - tcp_start)
+        thr = done / (tcp_elapsed / 60.0)
+        tcp_metrics = {
+            "tcp_throughput_per_min": round(thr, 1),
+            "tcp_targets": done,
+            "tcp_seconds": round(tcp_elapsed, 1),
+            "truncated": stop,
+        }
+        if stop:
+            covered_n = done // max(1, len(all_ips))
+            tcp_covered_ports = list(target_ports[:covered_n])
+            print(f"[!] TCP 触及时间闸门：已完整覆盖 {covered_n}/{len(target_ports)} "
+                  f"个端口，剩余下轮优先补扫", flush=True)
+        print(f"[*] TCP 实测吞吐 {thr:,.0f} 目标/分钟"
+              f"（{done:,} 个 / {tcp_elapsed / 60:.1f} 分钟）", flush=True)
+
         print(f"[+] 探活完成！开放: {len(open_ports):,} 个"
-              f"（过滤掉 {total - len(open_ports):,} 个关闭端口，"
-              f"TLS 阶段工作量降至 {len(open_ports) / max(total, 1) * 100:.2f}%）",
+              f"（TLS 阶段工作量降至 {len(open_ports) / max(total, 1) * 100:.2f}%）",
               flush=True)
 
         if not open_ports:
             with open("count.txt", "w") as f:
                 f.write("0")
+            write_scan_artifacts()
             print("[-] 无开放端口。", flush=True)
             return
 
-        # 黑洞 IP 过滤（端口数太少时无法判定，自动跳过）
         if len(target_ports) > BLACKHOLE_MIN_PORTS:
             threshold = max(BLACKHOLE_MIN, int(len(target_ports) * BLACKHOLE_RATIO))
             ip_cnt = Counter(ip for ip, _ in open_ports)
@@ -639,46 +685,47 @@ async def main():
             print(f"[*] 端口数 {len(target_ports)} ≤ {BLACKHOLE_MIN_PORTS}，"
                   f"跳过黑洞IP过滤", flush=True)
     else:
-        # 跳过预筛：直接对所有目标做 TLS。对有扫描检测的服务商更可靠，
-        # 因为不存在"TCP 被丢包 → 误判关闭 → TLS 没机会验"这条损失路径。
         open_ports = [(ip, p) for p in target_ports for ip in all_ips]
         print(f"\n[0/4 阶段零] TCP预筛已禁用，"
               f"直接对全部 {len(open_ports):,} 个目标做 TLS", flush=True)
-        print(f"[*] TLS 第一阶段预估最坏约 "
-              f"{len(open_ports) / (TLS_CONCURRENCY / STAGE1_TIMEOUT) / 60:.0f} 分钟"
-              f"（按每个目标都吃满超时算，实际通常快得多）", flush=True)
 
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
 
     # ==================== 第一阶段：CF 证书 ====================
     print(f"\n[1/4 第一阶段 TLS 探测] 校验 {len(open_ports):,} 个"
-          f"（并发={TLS_CONCURRENCY} 超时={STAGE1_TIMEOUT}s "
-          f"重试={TLS_RETRY}）...", flush=True)
-    r1 = await gather_staged(
+          f"（并发={TLS_CONCURRENCY} 超时={STAGE1_TIMEOUT}s 重试={TLS_RETRY}）...",
+          flush=True)
+    r1, t1 = await gather_staged(
         open_ports,
         lambda ip, p: retry_check(check_tls_sni_async, ip, p,
                                   CF_SNI_1, STAGE1_TIMEOUT, tls_sem),
-        "第一阶段")
+        "第一阶段", tls_deadline)
+    if t1:
+        pipeline_truncated = True
     pass_1 = [open_ports[i] for i, ok in enumerate(r1) if ok]
     print(f"[+] 第一阶段完成！保留: {len(pass_1):,} 个\n", flush=True)
     if not pass_1:
         with open("count.txt", "w") as f:
             f.write("0")
+        write_scan_artifacts()
         print("[-] 无有效目标通过第一阶段。", flush=True)
         return
 
     # ==================== 第二阶段：crypto 301 ====================
     print(f"[2/4 第二阶段 HTTP 校验] 校验 {len(pass_1):,} 个候选...", flush=True)
-    r2 = await gather_staged(
+    r2, t2 = await gather_staged(
         pass_1,
         lambda ip, p: retry_check(check_http_async, ip, p,
                                   CF_HOST_TEST, STAGE2_TIMEOUT, tls_sem),
-        "第二阶段")
+        "第二阶段", tls_deadline)
+    if t2:
+        pipeline_truncated = True
     pass_2 = [pass_1[i] for i, ok in enumerate(r2) if ok]
     print(f"[+] 第二阶段完成！保留: {len(pass_2):,} 个\n", flush=True)
     if not pass_2:
         with open("count.txt", "w") as f:
             f.write("0")
+        write_scan_artifacts()
         print("[-] 无有效目标通过第二阶段。", flush=True)
         return
 
@@ -687,46 +734,50 @@ async def main():
     if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
         domain = CUSTOM_CF_DOMAIN.strip()
         print(f"[3/4 第三阶段自定义域名校验] 校验 {len(pass_2):,} 个...", flush=True)
-        r3 = await gather_staged(
+        r3, t3 = await gather_staged(
             pass_2,
             lambda ip, p: retry_check(check_tls_sni_async, ip, p,
                                       domain, STAGE3_TIMEOUT, tls_sem),
-            "第三阶段")
+            "第三阶段", tls_deadline)
+        if t3:
+            pipeline_truncated = True
         final_items = [pass_2[i] for i, ok in enumerate(r3) if ok]
         print(f"[+] 第三阶段完成！有效目标: {len(final_items):,} 个", flush=True)
     else:
         print("[3/4] 未检测到 CUSTOM_CF_DOMAIN，跳过。", flush=True)
 
     # ==================== 第四阶段：API 确认 + 拿真实落地 ====================
-    api_results = []      # [(ip, port, country)]
+    api_results = []
+    uniq = sorted(set(final_items),
+                  key=lambda x: (ipaddress.ip_address(x[0]), x[1]))
     if final_items and CHECK_API and CHECK_API.strip():
-        uniq = sorted(set(final_items),
-                      key=lambda x: (ipaddress.ip_address(x[0]), x[1]))
-        print(f"\n[4/4 API 确认] 校验 {len(uniq)} 个"
-              f"（并发={API_CONCURRENCY} 超时={API_TIMEOUT}s "
-              f"重试={API_RETRY}）...", flush=True)
-        api_sem = asyncio.Semaphore(API_CONCURRENCY)
-        async with aiohttp.ClientSession() as session:
-            a_res = await asyncio.gather(
-                *[api_verify(session, ip, p, api_sem) for ip, p in uniq]
-            )
-        ok_n = dead_n = err_n = 0
-        for (ip, port), (st, country) in zip(uniq, a_res):
-            if st == "ok":
-                api_results.append((ip, port, country))
-                ok_n += 1
-            elif st == "error":
-                # API 没答上来 → 仍收录但 country 留占位，等 recheck 补
-                api_results.append((ip, port, "??"))
-                err_n += 1
-            else:
-                dead_n += 1      # API 明确说不通 → 丢弃
-        print(f"[+] API 确认: 通过 {ok_n} | 不通(丢弃) {dead_n} | "
-              f"异常(收录待复验) {err_n}", flush=True)
+        if tls_deadline and time.monotonic() > tls_deadline:
+            pipeline_truncated = True
+            print("[!] 触及时间闸门，跳过 API 确认，country 留 ?? 待 recheck", flush=True)
+            api_results = [(ip, port, "??") for ip, port in uniq]
+        else:
+            print(f"\n[4/4 API 确认] 校验 {len(uniq)} 个"
+                  f"（并发={API_CONCURRENCY} 超时={API_TIMEOUT}s 重试={API_RETRY}）...",
+                  flush=True)
+            api_sem = asyncio.Semaphore(API_CONCURRENCY)
+            async with aiohttp.ClientSession() as session:
+                a_res = await asyncio.gather(
+                    *[api_verify(session, ip, p, api_sem) for ip, p in uniq]
+                )
+            ok_n = dead_n = err_n = 0
+            for (ip, port), (st, country) in zip(uniq, a_res):
+                if st == "ok":
+                    api_results.append((ip, port, country))
+                    ok_n += 1
+                elif st == "error":
+                    api_results.append((ip, port, "??"))
+                    err_n += 1
+                else:
+                    dead_n += 1
+            print(f"[+] API 确认: 通过 {ok_n} | 不通(丢弃) {dead_n} | "
+                  f"异常(收录待复验) {err_n}", flush=True)
     else:
-        api_results = [(ip, port, "??") for ip, port in
-                       sorted(set(final_items),
-                              key=lambda x: (ipaddress.ip_address(x[0]), x[1]))]
+        api_results = [(ip, port, "??") for ip, port in uniq]
         print("[4/4] 未配置 CHECK_API，country 留 ?? 待 recheck 填。", flush=True)
 
     # ==================== 结果输出（追加去重 + 防覆盖保护） ====================
@@ -735,6 +786,7 @@ async def main():
     if not api_results:
         with open("count.txt", "w") as f:
             f.write("0")
+        write_scan_artifacts()
         print("\n==================== 扫描结束 ====================", flush=True)
         print("[!] 本次无有效结果，跳过写文件，不覆盖已有结果。", flush=True)
         return
@@ -774,6 +826,7 @@ async def main():
               f"疑似读取异常，不覆盖！", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
+        write_scan_artifacts()
         return
 
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
@@ -783,8 +836,12 @@ async def main():
     with open("count.txt", "w") as f:
         f.write(str(new_count))
 
+    write_scan_artifacts()
+
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
+    if pipeline_truncated:
+        print("[!] 本轮被时间闸门截断，端口未标记已扫，下轮优先补扫", flush=True)
     print(f"[+] 结果已保存（追加去重，详见私库）", flush=True)
 
 
