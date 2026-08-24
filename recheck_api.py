@@ -7,7 +7,7 @@ import urllib.parse
 import aiohttp
 
 # ==================== 配置 ====================
-CHECK_API = "https://check.tigaa.ccwu.cc/check"   # ← 你自建的检测 API
+CHECK_API = os.getenv("CHECK_API", "").strip()
 # 并发 50：check_one 在 sem 内部重试，sleep 期间不释放槽位，
 # API 完全无响应时单条最坏占用约 96 秒（30+2+30+4+30）。
 # 并发 20 折算每分钟仅 12.5 条，120 分钟上限约 1500 条；50 可支撑约 3750 条。
@@ -119,6 +119,9 @@ def format_line(ip, port, country, name):
 async def main():
     if len(sys.argv) < 2:
         print("[-] 用法: python recheck_api.py 文件1.txt [文件2.txt ...]", flush=True)
+        return
+    if not CHECK_API:
+        print("[-] CHECK_API 未配置，退出。", flush=True)
         return
 
     sem = asyncio.Semaphore(CONCURRENCY)
