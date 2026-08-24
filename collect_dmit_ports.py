@@ -22,6 +22,7 @@ IP_RE = re.compile(r"IP地址\s*[:：]\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})")
 PORT_RE = re.compile(r"端口\s*[:：]\s*(\d{1,5})")
 ASN_RE = re.compile(r"ASN编号\s*[:：]\s*(.+)", re.IGNORECASE)
 
+
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {"last_msg_id": 0, "ports": []}
@@ -35,6 +36,7 @@ def load_state():
     except Exception:
         return {"last_msg_id": 0, "ports": []}
 
+
 def save_state(last_msg_id: int, ports: set):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
@@ -46,6 +48,7 @@ def save_state(last_msg_id: int, ports: set):
             ensure_ascii=False,
             indent=2
         )
+
 
 def is_dmit_message(text: str) -> bool:
     """
@@ -63,6 +66,7 @@ def is_dmit_message(text: str) -> bool:
         if ("dmit" not in asn_line) and ("as906" not in asn_line):
             return False
     return True
+
 
 def extract_port_from_msg(text: str):
     if not text:
@@ -85,6 +89,7 @@ def extract_port_from_msg(text: str):
         return p
     return None
 
+
 async def main():
     state = load_state()
     last_msg_id = state["last_msg_id"]
@@ -99,7 +104,27 @@ async def main():
 
     client = TelegramClient(session_name, TG_API_ID, TG_API_HASH)
     await client.start()
-    chat = await client.get_entity(TG_SOURCE_CHAT)
+
+    # 关键：-100... 必须按 int 传给 Telethon
+    raw_chat = str(TG_SOURCE_CHAT).strip()
+    try:
+        chat_ref = int(raw_chat) if raw_chat.lstrip("-").isdigit() else raw_chat
+        chat = await client.get_entity(chat_ref)
+    except Exception as e:
+        print(f"[ERR] get_entity 失败: {raw_chat} | {type(e).__name__}: {e}")
+        print("[HINT] 若用 chat_id，请填 -100xxxxxxxxxx；并确认 TG_SESSION_B64 对应账号已在该群")
+        # 诊断：列出前50个会话
+        me = await client.get_me()
+        print(f"[DIAG] 当前账号: id={me.id}, username={getattr(me, 'username', None)}")
+        print("[DIAG] 最近可见会话(前50):")
+        c = 0
+        async for d in client.iter_dialogs(limit=50):
+            print(f"  id={d.id} name={d.name} username={getattr(d.entity,'username',None)}")
+            c += 1
+        if c == 0:
+            print("  (无会话)")
+        await client.disconnect()
+        raise
 
     newest_msg_id = last_msg_id
     newly_found = set()
@@ -138,6 +163,7 @@ async def main():
     print(f"[OK] newly_found={sorted(newly_found)}")
     print(f"[OK] state -> {STATE_FILE}")
     print(f"[OK] pool  -> {OUT_FILE}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
