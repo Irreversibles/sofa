@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
-      contents: write
+      contents: read   # 公仓只读，不写
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -28,23 +29,74 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install telethon
 
-      - name: Pull old results
+      - name: Pull old DMIT result + private port state
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          # 只拷自己的结果文件：本轮只会更新 DMIT.txt，
-          # 拉别的文件下来毫无用处，反而可能在 push 时把它们的旧副本推回去
           cp result_repo/DMIT.txt ./ 2>/dev/null || true
+          cp result_repo/dmit_ports_state.json ./ 2>/dev/null || true
+          cp result_repo/dmit_ports_pool.txt ./ 2>/dev/null || true
+          test -f dmit_ports_state.json || echo '{"last_msg_id":0,"ports":[]}' > dmit_ports_state.json
+
+      - name: Collect DMIT ports from TG (history + incremental)
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
+          TG_SOURCE_CHAT: ${{ secrets.TG_SOURCE_CHAT }}
+          TG_FETCH_LIMIT: "5000"
+          STATE_FILE: "dmit_ports_state.json"
+          OUT_FILE: "dmit_ports_pool.txt"
+        run: |
+          python collect_dmit_ports.py
+          # 仅打印数量，不打印端口明文
+          echo "[INFO] pool_count=$(wc -l < dmit_ports_pool.txt || echo 0)"
+
+      - name: Merge default ports + TG ports (masked)
+        env:
+          DEFAULT_PORTS: "443,8443,2053,2083,2096"
+        run: |
+          TG_PORTS=$(paste -sd, dmit_ports_pool.txt 2>/dev/null || true)
+          export TG_PORTS
+
+          python - <<'PY'
+import os
+
+def parse_ports(s):
+    out = set()
+    for x in (s or "").replace(" ", "").split(","):
+        if x.isdigit():
+            p = int(x)
+            if 1 <= p <= 65535:
+                out.add(p)
+    return out
+
+default_ports = parse_ports(os.environ.get("DEFAULT_PORTS", ""))
+tg_ports = parse_ports(os.environ.get("TG_PORTS", ""))
+merged = sorted(default_ports | tg_ports)
+merged_str = ",".join(str(p) for p in merged)
+
+# 不打印明文端口，只打印数量
+print(f"[INFO] default_count={len(default_ports)}")
+print(f"[INFO] tg_count={len(tg_ports)}")
+print(f"[INFO] merged_count={len(merged)}")
+
+with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+    f.write(f"MERGED_PORTS={merged_str}\n")
+    f.write(f"MERGED_PORTS_COUNT={len(merged)}\n")
+PY
 
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
         run: |
-          python check_cf_asn.py "906" "DMIT" "443,8443,2053,2083,2096"
+          echo "[INFO] DMIT scan with merged ports count: ${MERGED_PORTS_COUNT}"
+          python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
 
-      - name: Push result to private repo
+      - name: Push DMIT result + private port state to private repo
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
@@ -52,36 +104,40 @@ jobs:
             echo "DMIT.txt 不存在或为空，本次无结果，跳过推送"
             exit 0
           fi
+
           cp DMIT.txt result_repo/
+          cp dmit_ports_state.json result_repo/ 2>/dev/null || true
+          cp dmit_ports_pool.txt result_repo/ 2>/dev/null || true
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add DMIT.txt
+
+          git add DMIT.txt dmit_ports_state.json dmit_ports_pool.txt
+
           if git diff --staged --quiet; then
             echo "no change"
           else
-            git commit -m "auto: update DMIT"
+            git commit -m "auto: update DMIT + ports pool/state"
             for i in 1 2 3 4 5; do
               git push && break
               echo "push 冲突，第 $i 次重试..."
               if ! git pull --rebase origin main; then
-                # rebase 冲突处理：
-                #   .txt 结果文件是行集合、顺序无关，sort -u 取并集是安全的
-                #   （冲突通常来自 recheck 同时在刷 country / 剔除失效条目）
-                #   其他类型文件排序会破坏结构 → 放弃本次 rebase
                 CONFLICTS=$(git diff --name-only --diff-filter=U)
                 ABORT=0
                 if [ -n "$CONFLICTS" ]; then
                   for f in $CONFLICTS; do
                     case "$f" in
                       *.txt)
-                        echo "  合并冲突文件: $f"
                         sort -u "$f" -o "$f"
                         git add "$f"
                         ;;
+                      *.json)
+                        # 端口状态文件冲突时保留本次运行生成版本
+                        git checkout --ours "$f" || true
+                        git add "$f"
+                        ;;
                       *)
-                        echo "  非文本文件冲突，放弃本次 rebase: $f"
                         ABORT=1
                         break
                         ;;
@@ -100,16 +156,21 @@ jobs:
             done
           fi
 
+      - name: Cleanup local sensitive files
+        if: always()
+        run: |
+          rm -f dmit_ports_pool.txt dmit_ports_state.json
+
       - name: Notify TG
         if: always()
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          PCOUNT="${MERGED_PORTS_COUNT:-?}"
           if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A本次新增: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A端口数: ${PCOUNT}%0A本次新增: ${COUNT} 个"
           else
             MSG="❌ 扫描失败%0A服务商: DMIT%0A目标: AS906%0A状态: ${{ job.status }}"
           fi
-          echo "发送内容: ${MSG}"
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT_ID }} \
             -d text="${MSG}")
