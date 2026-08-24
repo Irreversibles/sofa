@@ -63,31 +63,31 @@ jobs:
           export TG_PORTS
 
           python - <<'PY'
-import os
+          import os
 
-def parse_ports(s):
-    out = set()
-    for x in (s or "").replace(" ", "").split(","):
-        if x.isdigit():
-            p = int(x)
-            if 1 <= p <= 65535:
-                out.add(p)
-    return out
+          def parse_ports(s):
+              out = set()
+              for x in (s or "").replace(" ", "").split(","):
+                  if x.isdigit():
+                      p = int(x)
+                      if 1 <= p <= 65535:
+                          out.add(p)
+              return out
 
-default_ports = parse_ports(os.environ.get("DEFAULT_PORTS", ""))
-tg_ports = parse_ports(os.environ.get("TG_PORTS", ""))
-merged = sorted(default_ports | tg_ports)
-merged_str = ",".join(str(p) for p in merged)
+          default_ports = parse_ports(os.environ.get("DEFAULT_PORTS", ""))
+          tg_ports = parse_ports(os.environ.get("TG_PORTS", ""))
+          merged = sorted(default_ports | tg_ports)
+          merged_str = ",".join(str(p) for p in merged)
 
-# 不打印明文端口，只打印数量
-print(f"[INFO] default_count={len(default_ports)}")
-print(f"[INFO] tg_count={len(tg_ports)}")
-print(f"[INFO] merged_count={len(merged)}")
+          # 不打印明文端口，只打印数量
+          print(f"[INFO] default_count={len(default_ports)}")
+          print(f"[INFO] tg_count={len(tg_ports)}")
+          print(f"[INFO] merged_count={len(merged)}")
 
-with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-    f.write(f"MERGED_PORTS={merged_str}\n")
-    f.write(f"MERGED_PORTS_COUNT={len(merged)}\n")
-PY
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"MERGED_PORTS={merged_str}\n")
+              f.write(f"MERGED_PORTS_COUNT={len(merged)}\n")
+          PY
 
       - name: Run Scan
         env:
@@ -133,7 +133,6 @@ PY
                         git add "$f"
                         ;;
                       *.json)
-                        # 端口状态文件冲突时保留本次运行生成版本
                         git checkout --ours "$f" || true
                         git add "$f"
                         ;;
