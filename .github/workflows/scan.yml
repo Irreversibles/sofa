@@ -49,11 +49,12 @@ jobs:
           # 拉所有结果文件：手动扫描的 name_label 可能是 auto，
           # 此刻还不知道最终文件名，所以只能全拉。
           # push 阶段会用 name.txt 精确指定推哪个，不会误推别的。
+          # 排除非结果文件，以及 DMIT 自动流程的端口档案（不该进手动扫描目录）。
           shopt -s nullglob
           for f in result_repo/*.txt; do
             fn=$(basename "$f")
             case "$fn" in
-              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt|dmit_ports_pool.txt) continue ;;
             esac
             cp "$f" ./ 2>/dev/null || true
           done
