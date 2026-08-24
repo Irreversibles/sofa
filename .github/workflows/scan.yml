@@ -61,6 +61,8 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          CHECK_API: ${{ secrets.CHECK_API }}
+          MASK_PORT_LOG: "1"
         run: |
           python check_cf_asn.py "${{ inputs.target }}" "${{ inputs.name_label }}" "${{ inputs.ports }}"
 
