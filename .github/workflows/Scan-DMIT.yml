@@ -3,7 +3,7 @@ name: Scan DMIT (AS906 adaptive stable + adaptive cadence)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'   # 每天 UTC 03:00，是否执行由运行时闸门决定
+    - cron: '20 2 * * *'   # 每天 UTC 02:20，是否执行由运行时闸门决定
 
 concurrency:
   group: scan-dmit
