@@ -3,6 +3,5 @@ masscan_out.json
 targets.txt
 __pycache__/
 *.pyc
-
 dmit_ports_pool.txt
 dmit_ports_state.json
