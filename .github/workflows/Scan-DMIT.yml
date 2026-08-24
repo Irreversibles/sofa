@@ -41,6 +41,8 @@ jobs:
           cp result_repo/dmit_ports_pool.txt ./ 2>/dev/null || true
           test -f dmit_ports_state.json || echo '{"last_msg_id":0,"ports":[]}' > dmit_ports_state.json
 
+      # 收集无条件执行：即使今天不扫，也要把新端口和 last_msg_id 存下来，
+      # 否则跳过的那几天读到的消息会白读（TG_FETCH_LIMIT 覆盖不到时会永久漏）
       - name: Collect DMIT ports from TG
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -75,6 +77,12 @@ jobs:
             SHOULD_RUN=true
           else
             SHOULD_RUN=false
+          fi
+
+          # 手动触发时无视闸门，方便临时验证
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHOULD_RUN=true
+            echo "[INFO] manual dispatch -> force run"
           fi
 
           echo "POOL_COUNT=$POOL_COUNT" >> "$GITHUB_ENV"
@@ -136,15 +144,22 @@ jobs:
           else:
               max_extra = extra_huge
 
+          # 读 state：必须保留 last_msg_id / ports，那是收集脚本的字段
           st = {}
-          cursor = 0
           try:
               with open(STATE, "r", encoding="utf-8") as f:
-                  st = json.load(f)
-              cursor = int(st.get("extra_cursor", 0))
+                  loaded = json.load(f)
+              if isinstance(loaded, dict):
+                  st = loaded
           except Exception:
               st = {}
 
+          # state 损坏时至少把端口池从 pool 文件救回来，
+          # 否则下面的回写会把 ports 清空
+          if not st.get("ports") and tg_ports_all:
+              st["ports"] = tg_ports_all
+
+          cursor = int(st.get("extra_cursor", 0) or 0)
           prev_sig = st.get("last_selected_sig", "")
 
           def select_batch(pool, start, k):
@@ -185,6 +200,7 @@ jobs:
           print(f"[INFO] extra_pool_count={extra_cnt}")
           print(f"[INFO] adaptive_max_extra={max_extra}")
           print(f"[INFO] extra_selected_count={len(selected)}")
+          print(f"[INFO] cursor: {cursor} -> {next_cursor}")
           print(f"[INFO] merged_count={len(merged)}")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
@@ -205,7 +221,52 @@ jobs:
           echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT}"
           python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
 
-      - name: Push DMIT result + private port state
+      # state / pool 无条件推送：跳过扫描的日子也要保住收集成果和轮转游标
+      - name: Push port state (always)
+        if: always()
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          test -d result_repo || exit 0
+          test -f dmit_ports_state.json || exit 0
+
+          cp dmit_ports_state.json result_repo/ 2>/dev/null || true
+          cp dmit_ports_pool.txt result_repo/ 2>/dev/null || true
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add dmit_ports_state.json dmit_ports_pool.txt 2>/dev/null || true
+
+          if git diff --staged --quiet; then
+            echo "no state change"
+            exit 0
+          fi
+
+          git commit -m "auto: update DMIT port state"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "state push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    # rebase 语境下 --theirs 才是"正在重放的本次提交"
+                    *.json) git checkout --theirs "$f" || true ;;
+                    *)      sort -u "$f" -o "$f" ;;
+                  esac
+                  git add "$f"
+                done
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Push DMIT result
         if: env.SHOULD_RUN == 'true'
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
@@ -216,53 +277,52 @@ jobs:
           fi
 
           cp DMIT.txt result_repo/
-          cp dmit_ports_state.json result_repo/ 2>/dev/null || true
-          cp dmit_ports_pool.txt result_repo/ 2>/dev/null || true
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add DMIT.txt dmit_ports_state.json dmit_ports_pool.txt
+          git add DMIT.txt
 
           if git diff --staged --quiet; then
             echo "no change"
-          else
-            git commit -m "auto: update DMIT + adaptive ports state"
-            for i in 1 2 3 4 5; do
-              git push && break
-              echo "push 冲突，第 $i 次重试..."
-              if ! git pull --rebase origin main; then
-                CONFLICTS=$(git diff --name-only --diff-filter=U)
-                ABORT=0
-                if [ -n "$CONFLICTS" ]; then
-                  for f in $CONFLICTS; do
-                    case "$f" in
-                      *.txt)
-                        sort -u "$f" -o "$f"
-                        git add "$f"
-                        ;;
-                      *.json)
-                        git checkout --ours "$f" || true
-                        git add "$f"
-                        ;;
-                      *)
-                        ABORT=1
-                        break
-                        ;;
-                    esac
-                  done
-                fi
-                if [ "$ABORT" = "1" ]; then
-                  git rebase --abort 2>/dev/null || true
-                elif [ -n "$CONFLICTS" ]; then
-                  GIT_EDITOR=true git rebase --continue || git rebase --abort
-                else
-                  git rebase --abort 2>/dev/null || true
-                fi
-              fi
-              sleep $((RANDOM % 10 + 5))
-            done
+            exit 0
           fi
+
+          git commit -m "auto: update DMIT"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              ABORT=0
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.txt)
+                      sort -u "$f" -o "$f"
+                      git add "$f"
+                      ;;
+                    *.json)
+                      git checkout --theirs "$f" || true
+                      git add "$f"
+                      ;;
+                    *)
+                      ABORT=1
+                      break
+                      ;;
+                  esac
+                done
+              fi
+              if [ "$ABORT" = "1" ]; then
+                git rebase --abort 2>/dev/null || true
+              elif [ -n "$CONFLICTS" ]; then
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
 
       - name: Cleanup local sensitive files
         if: always()
@@ -280,12 +340,13 @@ jobs:
           CAD_POOL="${POOL_COUNT:-?}"
           CAD_INT="${ADAPTIVE_INTERVAL:-?}"
 
-          if [ "${SHOULD_RUN:-false}" != "true" ]; then
-            MSG="⏭️ 本次跳过%0A服务商: DMIT%0A高位池: ${CAD_POOL}%0A策略频率: 每${CAD_INT}天"
-          elif [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A端口总数: ${PCOUNT}%0A高位池: ${EX_POOL}%0A本次高位: ${EX_SEL}(上限${EX_MAX})%0A策略频率: 每${CAD_INT}天%0A本次新增: ${COUNT} 个"
-          else
+          # 先判失败：否则 Pull/Collect 阶段出错会被误报成"跳过"
+          if [ "${{ job.status }}" != "success" ]; then
             MSG="❌ 扫描失败%0A服务商: DMIT%0A目标: AS906%0A状态: ${{ job.status }}"
+          elif [ "${SHOULD_RUN:-false}" != "true" ]; then
+            MSG="⏭️ 本次跳过%0A服务商: DMIT%0A高位池: ${CAD_POOL}%0A策略频率: 每${CAD_INT}天"
+          else
+            MSG="✅ 扫描完成%0A服务商: DMIT%0A目标: AS906%0A端口总数: ${PCOUNT}%0A高位池: ${EX_POOL}%0A本次高位: ${EX_SEL}(上限${EX_MAX})%0A策略频率: 每${CAD_INT}天%0A本次新增: ${COUNT} 个"
           fi
 
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
