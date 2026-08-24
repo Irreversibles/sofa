@@ -37,6 +37,8 @@ jobs:
           done
 
       - name: Recheck
+        env:
+          CHECK_API: ${{ secrets.CHECK_API }}
         run: |
           shopt -s nullglob
           FILES=""
