@@ -1,16 +1,26 @@
+#!/usr/bin/env python3
+"""
+从 TG 群收集 DMIT(AS906) 的端口，累积成端口池。
+
+state 文件是多方共写的：本脚本负责 last_msg_id / ports，
+workflow 的轮转逻辑负责 extra_cursor / last_selected_sig 等。
+所以读的时候必须原样保留全部字段，写的时候只覆盖自己那两个 ——
+否则会擦掉轮转游标，导致每轮都从池子开头选同一批端口。
+"""
 import os
 import re
 import json
 import asyncio
+
 from telethon import TelegramClient
 
 # ========= 环境变量 =========
 TG_API_ID = int(os.environ["TG_API_ID"])
 TG_API_HASH = os.environ["TG_API_HASH"]
-TG_SOURCE_CHAT = os.environ["TG_SOURCE_CHAT"]  # @group 或 -100xxxx
+TG_SOURCE_CHAT = os.environ["TG_SOURCE_CHAT"]   # @group 或 -100xxxx
 TG_FETCH_LIMIT = int(os.environ.get("TG_FETCH_LIMIT", "5000"))
 
-# 可选：session base64
+# 可选：session base64（CI 里无法交互输验证码，必须预先注入）
 TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "")
 
 STATE_FILE = os.environ.get("STATE_FILE", "dmit_ports_state.json")
@@ -23,27 +33,27 @@ ASN_RE = re.compile(r"ASN编号\s*[:：]\s*(.+)", re.IGNORECASE)
 
 
 def load_state():
+    """原样返回整个 dict —— 不能只挑自己关心的字段，否则回写时
+    会丢掉 workflow 维护的 extra_cursor / last_selected_sig。"""
     if not os.path.exists(STATE_FILE):
-        return {"last_msg_id": 0, "ports": []}
+        return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {
-            "last_msg_id": int(data.get("last_msg_id", 0)),
-            "ports": [int(x) for x in data.get("ports", []) if str(x).isdigit()],
-        }
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return {"last_msg_id": 0, "ports": []}
+        return {}
 
 
-def save_state_atomic(last_msg_id: int, ports: set):
+def save_state_atomic(state: dict, last_msg_id: int, ports: set):
+    """只更新本脚本负责的两个字段，其余原样保留。"""
+    state = dict(state or {})
+    state["last_msg_id"] = int(last_msg_id)
+    state["ports"] = sorted(ports)
+
     tmp = STATE_FILE + ".tmp"
-    data = {
-        "last_msg_id": int(last_msg_id),
-        "ports": sorted(list(ports)),
-    }
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
 
@@ -71,15 +81,13 @@ def extract_port_from_msg(text: str):
     if not m:
         return None
     p = int(m.group(1))
-    if 1 <= p <= 65535:
-        return p
-    return None
+    return p if 1 <= p <= 65535 else None
 
 
 async def main():
     st = load_state()
-    last_msg_id = st["last_msg_id"]
-    port_pool = set(st["ports"])
+    last_msg_id = int(st.get("last_msg_id", 0) or 0)
+    port_pool = {int(x) for x in st.get("ports", []) if str(x).isdigit()}
 
     session_name = "tg_dmit_ports"
     if TG_SESSION_B64:
@@ -125,7 +133,7 @@ async def main():
         for p in sorted(port_pool):
             f.write(str(p) + "\n")
 
-    save_state_atomic(newest_msg_id, port_pool)
+    save_state_atomic(st, newest_msg_id, port_pool)
 
     print(f"[OK] last_msg_id(old)={last_msg_id}, last_msg_id(new)={newest_msg_id}")
     print(f"[OK] total_ports={len(port_pool)}")
