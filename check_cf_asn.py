@@ -54,6 +54,7 @@ DEFAULT_TARGET = os.getenv("ASN_LIST", "AS36002")
 DEFAULT_NAME = os.getenv("NAME_LABEL", "auto")
 DEFAULT_PORTS = os.getenv("PORTS", "443,8443,2053,2083,2096")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
+MASK_PORT_LOG = os.getenv("MASK_PORT_LOG", "0") == "1"
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
@@ -553,7 +554,10 @@ async def main():
     apply_asn_profile(first_target.upper().replace("AS", ""))
 
     target_ports = pick_ports(ports_input)
-    print(f"[*] 本次使用端口({len(target_ports)}个): {target_ports}", flush=True)
+    if MASK_PORT_LOG:
+        print(f"[*] 本次使用端口数: {len(target_ports)}（已隐藏）", flush=True)
+    else:
+        print(f"[*] 本次使用端口({len(target_ports)}个): {target_ports}", flush=True)
 
     print(f"\n[*] 正在解析目标...", flush=True)
     all_ips = await parse_targets_async(target_input)
