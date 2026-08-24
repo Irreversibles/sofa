@@ -40,6 +40,7 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          CHECK_API: ${{ secrets.CHECK_API }}
         run: |
           python check_cf_asn.py "3258" "xTom-jp" "443,8443,2053,2083,2096"
 
