@@ -1,4 +1,4 @@
-name: Scan DMIT (AS906 budget-driven + cycle cadence)
+name: Scan DMIT (AS906 budget-driven + cycle cadence + time gate)
 
 on:
   workflow_dispatch:
@@ -58,11 +58,11 @@ jobs:
           ASN: "906"
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           SCAN_BUDGET_MIN: "170"
-          TCP_THROUGHPUT: "28000"
+          TCP_THROUGHPUT: "22000"
+          THROUGHPUT_SAFETY: "0.85"
+          EMA_ALPHA: "0.5"
           PORTS_MIN_TOTAL: "10"
           PORTS_MAX_TOTAL: "80"
-          HOT_MIN_COUNT: "5"
-          HOT_SHARE: "0.5"
           CADENCE_CYCLE1_DAYS: "3"
           CADENCE_CYCLE2_DAYS: "2"
           CADENCE_CYCLE4_DAYS: "1"
@@ -76,11 +76,12 @@ jobs:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
           CHECK_API: ${{ secrets.CHECK_API }}
           MASK_PORT_LOG: "1"
+          SCAN_DEADLINE_MIN: "300"
         run: |
           echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
           python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
 
-      # 只有真正扫成功才推进轮转 + 记录扫描时刻
+      # 只有真正扫成功才推进轮转（读 scan_done_ports.txt）+ EMA 校准吞吐
       - name: Finalize port rotation
         if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
@@ -182,18 +183,24 @@ jobs:
 
       - name: Cleanup local sensitive files
         if: always()
-        run: rm -f dmit_ports_pool.txt dmit_ports_state.json
+        run: |
+          rm -f dmit_ports_pool.txt dmit_ports_state.json
+          rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
 
       - name: Notify TG
         if: always()
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          TRUNC=$(cat scan_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全，剩余下轮优先补"
+
           if [ "${{ job.status }}" != "success" ]; then
             MSG="❌ 扫描失败%0A服务商: DMIT (AS906)%0A状态: ${{ job.status }}"
           elif [ "${SHOULD_RUN:-false}" != "true" ]; then
-            MSG="⏭️ 本次跳过%0A服务商: DMIT (AS906)%0A端口档案: ${POOL_COUNT:-?}%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天"
+            MSG="⏭️ 本次跳过%0A服务商: DMIT (AS906)%0A端口档案: ${POOL_COUNT:-?}%0A阶段: ${SWEEP_PHASE:-?}（待覆盖 ${REMAINING_UNSCANNED:-?}）%0A间隔 ${CADENCE_DAYS:-?} 天"
           else
-            MSG="✅ 扫描完成%0A服务商: DMIT (AS906)%0A端口: ${MERGED_PORTS_COUNT:-?}（高频 ${HOT_COUNT:-?} + 轮转 ${ROTATE_COUNT:-?}）%0A档案: ${POOL_COUNT:-?}%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天%0A本次新增: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: DMIT (AS906)%0A端口: ${MERGED_PORTS_COUNT:-?}（默认5 + 新扫 ${NEW_COUNT:-?} + 复扫 ${RESCAN_COUNT:-?}）%0A阶段: ${SWEEP_PHASE:-?}（池 ${POOL_COUNT:-?}，待覆盖 ${REMAINING_UNSCANNED:-?}）%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天%0A本次新增: ${COUNT} 个${WARN}"
           fi
 
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
