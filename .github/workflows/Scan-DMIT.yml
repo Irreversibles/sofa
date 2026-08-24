@@ -55,15 +55,18 @@ jobs:
           # 仅打印数量，不打印端口明文
           echo "[INFO] pool_count=$(wc -l < dmit_ports_pool.txt || echo 0)"
 
-      - name: Merge default ports + TG ports (masked)
+      - name: Merge default + rotate extra TG ports (masked)
         env:
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
+          MAX_EXTRA_PORTS: "20"   # 每次最多带 20 个高位端口（可调）
         run: |
           TG_PORTS=$(paste -sd, dmit_ports_pool.txt 2>/dev/null || true)
           export TG_PORTS
 
           python - <<'PY'
-          import os
+          import os, json
+
+          STATE = "dmit_ports_state.json"
 
           def parse_ports(s):
               out = set()
@@ -74,14 +77,49 @@ jobs:
                           out.add(p)
               return out
 
-          default_ports = parse_ports(os.environ.get("DEFAULT_PORTS", ""))
-          tg_ports = parse_ports(os.environ.get("TG_PORTS", ""))
-          merged = sorted(default_ports | tg_ports)
+          default_ports = sorted(parse_ports(os.environ.get("DEFAULT_PORTS", "")))
+          tg_ports_all = sorted(parse_ports(os.environ.get("TG_PORTS", "")))
+          max_extra = int(os.environ.get("MAX_EXTRA_PORTS", "20"))
+
+          default_set = set(default_ports)
+          extra_pool = [p for p in tg_ports_all if p not in default_set]
+
+          cursor = 0
+          st = {}
+          try:
+              with open(STATE, "r", encoding="utf-8") as f:
+                  st = json.load(f)
+              cursor = int(st.get("extra_cursor", 0))
+          except Exception:
+              st = {}
+
+          if extra_pool and max_extra > 0:
+              n = len(extra_pool)
+              cursor = cursor % n
+              selected = []
+              i = cursor
+              for _ in range(min(max_extra, n)):
+                  selected.append(extra_pool[i])
+                  i = (i + 1) % n
+              next_cursor = i
+          else:
+              selected = []
+              next_cursor = 0
+
+          merged = sorted(set(default_ports) | set(selected))
           merged_str = ",".join(str(p) for p in merged)
 
-          # 不打印明文端口，只打印数量
+          # 回写轮转状态（不打印端口明文）
+          st["extra_cursor"] = int(next_cursor)
+          st["extra_pool_count"] = len(extra_pool)
+          st["extra_selected_count"] = len(selected)
+          with open(STATE, "w", encoding="utf-8") as f:
+              json.dump(st, f, ensure_ascii=False, indent=2)
+
           print(f"[INFO] default_count={len(default_ports)}")
-          print(f"[INFO] tg_count={len(tg_ports)}")
+          print(f"[INFO] tg_total_count={len(tg_ports_all)}")
+          print(f"[INFO] extra_pool_count={len(extra_pool)}")
+          print(f"[INFO] extra_selected_count={len(selected)}")
           print(f"[INFO] merged_count={len(merged)}")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
