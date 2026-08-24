@@ -74,7 +74,7 @@ TLS_RETRY = int(os.getenv("TLS_RETRY", "1"))
 # 三阶段只证明"TLS 能透传到 CF 边缘"，不证明"能作为 proxyip 转发"。
 # 这一步用自建 Worker 实测转发并拿真实落地国家 —— GeoIP 给的是 IP 注册地，
 # 与落地常不一致（云厂商尤其明显），所以 country 只认这里的结果。
-CHECK_API = os.getenv("CHECK_API", "https://check.tigaa.ccwu.cc/check")
+CHECK_API = os.getenv("CHECK_API", "").strip()
 API_CONCURRENCY = int(os.getenv("API_CONC", "20"))
 API_TIMEOUT = 30
 API_RETRY = 2
@@ -444,6 +444,11 @@ async def main():
     target_input = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET
     name_arg = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
     ports_input = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_PORTS
+    if not CHECK_API:
+        print("[-] CHECK_API 未配置，退出。", flush=True)
+        with open("count.txt", "w", encoding="utf-8") as f:
+            f.write("0")
+        return
 
     name_label = _safe_filename(name_arg)
     with open("name.txt", "w", encoding="utf-8") as f:
