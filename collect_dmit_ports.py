@@ -130,8 +130,8 @@ async def main():
     print(f"[OK] last_msg_id(old)={last_msg_id}, last_msg_id(new)={newest_msg_id}")
     print(f"[OK] total_ports={len(port_pool)}")
     print(f"[OK] newly_found_count={len(newly_found)}")
-    print(f"[OK] state -> {STATE_FILE}")
-    print(f"[OK] pool  -> {OUT_FILE}")
+    print("[OK] state updated")
+    print("[OK] pool updated")
 
 
 if __name__ == "__main__":
