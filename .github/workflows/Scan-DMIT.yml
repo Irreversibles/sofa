@@ -1,4 +1,4 @@
-name: Scan DMIT (AS906 budget-driven + cycle cadence + time gate)
+name: Scan DMIT (AS906 masscan + budget-driven + cycle cadence)
 
 on:
   workflow_dispatch:
@@ -30,6 +30,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install telethon
+          sudo apt-get update
+          sudo apt-get install -y masscan
 
       - name: Pull old result + port state
         env:
@@ -58,7 +60,7 @@ jobs:
           ASN: "906"
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           SCAN_BUDGET_MIN: "170"
-          TCP_THROUGHPUT: "22000"
+          TCP_THROUGHPUT: "60000"
           THROUGHPUT_SAFETY: "0.85"
           EMA_ALPHA: "0.5"
           PORTS_MIN_TOTAL: "10"
@@ -77,9 +79,12 @@ jobs:
           CHECK_API: ${{ secrets.CHECK_API }}
           MASK_PORT_LOG: "1"
           SCAN_DEADLINE_MIN: "300"
+          MASSCAN_RATE: "5000"
+          MASSCAN_RETRIES: "2"
+          MASSCAN_WAIT: "5"
         run: |
           echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
-          python check_cf_asn.py "906" "DMIT" "${MERGED_PORTS}"
+          python check_cf_asn_masscan_dmit.py "906" "DMIT" "${MERGED_PORTS}"
 
       # 只有真正扫成功才推进轮转（读 scan_done_ports.txt）+ EMA 校准吞吐
       - name: Finalize port rotation
@@ -186,6 +191,7 @@ jobs:
         run: |
           rm -f dmit_ports_pool.txt dmit_ports_state.json
           rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -rf .tmp
 
       - name: Notify TG
         if: always()
