@@ -67,7 +67,7 @@ TLS_RETRY = 1
 # 三阶段只证明"TLS 能透传到 CF 边缘"，不证明"能作为 proxyip 转发"。
 # 这一步用自建 Worker 实测转发并拿真实落地国家 —— GeoIP 给的是 IP 注册地，
 # 与落地常不一致（云厂商尤其明显），所以 country 只认这里的结果。
-CHECK_API = os.getenv("CHECK_API", "https://check.tigaa.ccwu.cc/check")
+CHECK_API = os.getenv("CHECK_API", "").strip()
 API_CONCURRENCY = int(os.getenv("API_CONC", "20"))
 API_TIMEOUT = 30
 API_RETRY = 2
