@@ -75,6 +75,7 @@ jobs:
           MASSCAN_RETRIES: ${{ inputs.masscan_retries || '2' }}
           MASSCAN_WAIT: ${{ inputs.masscan_wait || '5' }}
           TLS_CONC: ${{ inputs.tls_conc || '300' }}
+          CHECK_API: ${{ secrets.CHECK_API }}
         run: |
           ulimit -n 65535
           python check_cf_asn_masscan.py "132203" "Tencent" "${{ inputs.ports || '443,8443' }}"
