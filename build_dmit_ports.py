@@ -2,8 +2,13 @@
 """
 决定本轮扫哪些端口、以及本轮到底跑不跑。
 
-配额：按时间预算反推，用实测吞吐(EMA)自校准 —— 吞吐骤降/IP暴增时
-      配额自动收缩，配合 check_cf_asn.py 的硬时间闸门，双保险不超时。
+严格覆盖优先（本次核心）：
+    只要池子里还有没扫过的端口(last_scanned==0)，就只从未扫端口里选，
+    绝不复扫 —— 哪怕配额没用满。只有整个池子都扫过一遍后，才进入复扫
+    阶段（最久没扫的优先）。频次不再是插队重扫的理由，只在"同为未扫"
+    时决定谁先扫。这样保证：一圈没走完前，任何端口都不会被重复扫。
+
+配额：按时间预算反推，用实测吞吐(EMA)自校准。
 节奏：按 cycle（轮转一圈需要几轮）自适应。
 截断：被闸门截断而没扫全的端口不标记已扫，下轮自动优先补。
 
@@ -26,16 +31,11 @@ ASN = os.environ.get("ASN", "906").replace("AS", "").strip()
 DEFAULT_PORTS = os.environ.get("DEFAULT_PORTS", "443,8443,2053,2083,2096")
 
 SCAN_BUDGET_MIN = float(os.environ.get("SCAN_BUDGET_MIN", "170"))
-# 初始/回退吞吐：还没有实测 EMA 时用它，取保守值宁可第一轮少扫
 TCP_THROUGHPUT_INIT = float(os.environ.get("TCP_THROUGHPUT", "22000"))
-# 安全系数：配额按 EMA×这个算，给吞吐波动留余量
 THROUGHPUT_SAFETY = float(os.environ.get("THROUGHPUT_SAFETY", "0.85"))
 EMA_ALPHA = float(os.environ.get("EMA_ALPHA", "0.5"))
 PORTS_MIN_TOTAL = int(os.environ.get("PORTS_MIN_TOTAL", "10"))
 PORTS_MAX_TOTAL = int(os.environ.get("PORTS_MAX_TOTAL", "80"))
-
-HOT_MIN_COUNT = int(os.environ.get("HOT_MIN_COUNT", "5"))
-HOT_SHARE = float(os.environ.get("HOT_SHARE", "0.5"))
 
 CADENCE_1 = int(os.environ.get("CADENCE_CYCLE1_DAYS", "3"))
 CADENCE_2 = int(os.environ.get("CADENCE_CYCLE2_DAYS", "2"))
@@ -156,7 +156,7 @@ def finalize():
             n += 1
     skipped = len(pend) - len(mark)
 
-    # --- EMA 自校准吞吐（截断与否，实测速度都真实有效）---
+    # --- EMA 自校准吞吐 ---
     m = _read_metrics()
     measured = float(m.get("tcp_throughput_per_min", 0) or 0)
     if measured > 0:
@@ -201,7 +201,6 @@ def main():
         src = "兜底估值"
     print(f"[*] AS{ASN} IP 数: {ip_count:,}（{src}）", flush=True)
 
-    # --- 吞吐：优先用实测 EMA，没有则用保守初值 ---
     ema = float(st.get("throughput_ema", 0) or 0)
     if ema > 0:
         thr = ema * THROUGHPUT_SAFETY
@@ -221,25 +220,42 @@ def main():
     pool = [int(k) for k in ports if int(k) not in default_set]
     extra_quota = max(0, total_ports - len(default_ports))
 
-    hot_all = sorted(
-        (p for p in pool if int(ports[str(p)].get("count", 1) or 1) >= HOT_MIN_COUNT),
-        key=lambda p: (-int(ports[str(p)].get("count", 1) or 1), p))
-    hot_cap = int(extra_quota * HOT_SHARE)
-    hot_sel = hot_all[:hot_cap]
+    def ls(p):
+        return int(ports[str(p)].get("last_scanned", 0) or 0)
 
-    rest = [p for p in pool if p not in set(hot_sel)]
-    rest.sort(key=lambda p: (int(ports[str(p)].get("last_scanned", 0) or 0),
-                             -int(ports[str(p)].get("count", 1) or 1), p))
-    rotate_sel = rest[:max(0, extra_quota - len(hot_sel))]
+    def cnt(p):
+        return int(ports[str(p)].get("count", 1) or 1)
 
-    selected = sorted(set(hot_sel) | set(rotate_sel))
+    # ---- 严格覆盖优先 ----
+    unscanned = sorted((p for p in pool if ls(p) == 0),
+                       key=lambda p: (-cnt(p), p))       # 高频先扫
+    scanned = sorted((p for p in pool if ls(p) > 0),
+                     key=lambda p: (ls(p), -cnt(p), p))  # 复扫：最久没扫先
+
+    if unscanned:
+        # 本圈还有没扫过的 —— 只从未扫端口里选，配额没用满也不复扫
+        selected = sorted(unscanned[:extra_quota])
+        phase = "覆盖中"
+    elif scanned:
+        # 整个池子已扫过一遍 —— 进入复扫
+        selected = sorted(scanned[:extra_quota])
+        phase = "复扫"
+    else:
+        selected = []
+        phase = "空池"
+
+    new_sel = sum(1 for p in selected if ls(p) == 0)
+    rescan_sel = len(selected) - new_sel
+    remaining_unscanned = (max(0, len(unscanned) - len(selected))
+                           if phase == "覆盖中" else 0)
+
     merged = sorted(default_set | set(selected))
     merged_str = ",".join(str(p) for p in merged)
 
     st["pending_selected"] = selected
     save_state(STATE_FILE, st)
 
-    cycle = math.ceil(len(pool) / max(1, len(rotate_sel))) if rotate_sel else 1
+    cycle = math.ceil(len(pool) / max(1, extra_quota)) if extra_quota > 0 else 1
     interval = interval_for_cycle(cycle)
     last_scan_ts = int(st.get("last_scan_ts", 0) or 0)
     elapsed_days = (now_ts() - last_scan_ts) / 86400.0 if last_scan_ts else 1e9
@@ -254,14 +270,14 @@ def main():
         should_run = False
         reason = f"距上次 {elapsed_days:.1f}d < 间隔 {interval}d"
 
-    # 预计耗时用真实 EMA（不带安全系数），更贴近实际
     real_thr = ema if ema > 0 else TCP_THROUGHPUT_INIT
     est_min = (ip_count * len(merged)) / real_thr
 
-    print(f"[*] 档案 {len(ports)} 端口（可轮转 {len(pool)}，"
-          f"频次≥{HOT_MIN_COUNT} 的 {len(hot_all)}）", flush=True)
-    print(f"[*] 本轮: 默认 {len(default_ports)} + 高频 {len(hot_sel)} "
-          f"+ 轮转 {len(rotate_sel)} = {len(merged)} 端口", flush=True)
+    print(f"[*] 档案 {len(ports)} 端口（可轮转 {len(pool)}，未扫 {len(unscanned)}，"
+          f"已扫 {len(scanned)}）", flush=True)
+    print(f"[*] 阶段={phase} | 本轮: 默认 {len(default_ports)} + 新扫 {new_sel} "
+          f"+ 复扫 {rescan_sel} = {len(merged)} 端口"
+          f"（待覆盖剩余 {remaining_unscanned}）", flush=True)
     print(f"[*] 轮转一圈 {cycle} 轮 → 间隔 {interval} 天 | {reason} "
           f"→ SHOULD_RUN={should_run}", flush=True)
     print(f"[*] 预计 {ip_count * len(merged):,} 目标 / 约 {est_min:.0f} 分钟", flush=True)
@@ -271,8 +287,10 @@ def main():
         "MERGED_PORTS": merged_str,
         "MERGED_PORTS_COUNT": len(merged),
         "POOL_COUNT": len(ports),
-        "HOT_COUNT": len(hot_sel),
-        "ROTATE_COUNT": len(rotate_sel),
+        "NEW_COUNT": new_sel,
+        "RESCAN_COUNT": rescan_sel,
+        "SWEEP_PHASE": phase,
+        "REMAINING_UNSCANNED": remaining_unscanned,
         "CYCLE_ROUNDS": cycle,
         "CADENCE_DAYS": interval,
         "EST_MINUTES": f"{est_min:.0f}",
