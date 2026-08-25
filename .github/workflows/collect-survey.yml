@@ -1,0 +1,45 @@
+name: Collect Survey (dry-run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fetch_limit:
+        description: '回读消息条数'
+        required: false
+        default: '20000'
+
+jobs:
+  survey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Telethon
+        run: |
+          python -m pip install --upgrade pip
+          pip install telethon
+
+      # 不拉 state：last_msg_id=0 → 从最新往回读满 limit 条完整历史
+      # DRY_RUN=1 → 只统计不写文件，无任何推送
+      - name: Survey ASN distribution
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
+          TG_SOURCE_CHAT: ${{ secrets.TG_SOURCE_CHAT }}
+          TG_FETCH_LIMIT: ${{ inputs.fetch_limit }}
+          STATE_FILE: "survey_state.json"
+          DRY_RUN: "1"
+        run: python collect_dmit_ports.py
+
+      - name: Cleanup
+        if: always()
+        run: rm -f survey_state.json tg_dmit_ports.session
