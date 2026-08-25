@@ -2,15 +2,16 @@
 """
 从 TG 群收集所有服务商的高位端口，按 ASN 分组累积成档案。
 
-三重过滤，保证只吃 bot 的 IP 发布消息：
-  1) 发送者必须是 @cf_ip_fabu_bot（id 8297124834）—— id 比 username 稳
+三重过滤，保证只吃发布 bot 的 IP 消息：
+  1) 发送者白名单 TG_SENDER —— 由 secret 传入，不硬编码在代码里
+     （本仓库公开，bot 标识不落公开代码）；留空则退化为仅靠内容特征
   2) 内容必须带 #CF优选IP —— 同一 bot 也用 "CF中转IP发布" 标题发
      GitHub 曝光检测报告等非 IP 消息，那些没这个标签
   3) 必须有 IP地址 和 端口 字段 —— 群友带标签的闲聊在此被挡
 
 分桶键只接受纯数字 AS 号。少数消息的 ASN编号 字段异常（正则会抓到下一行
 的运营商名），这类整条丢弃 —— 比造一堆名字键干净。
-CF 自家 ASN（13335 / 209242）在黑名单里：那些 IP 本身就是 CF 边缘，
+CF 自家 ASN（13335 / 209242）在黑名单里：那些 IP 是 CF 边缘本身，
 不是 proxyip 后端，扫了没意义。
 
 抓取策略：优先用 Telegram 服务端搜索只拉带标签的消息（省几个数量级流量），
@@ -43,8 +44,9 @@ TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "")
 # 0 = 不限条数，读完整历史（配合服务端搜索，成本很低）
 TG_FETCH_LIMIT = int(os.environ.get("TG_FETCH_LIMIT", "0"))
 TG_SEARCH = os.environ.get("TG_SEARCH", "#CF优选IP")
-# 只认这个 bot 发的。数字 id 最稳，且不必额外调 get_sender
-TG_SENDER = os.environ.get("TG_SENDER", "8297124834").strip()
+# 发送者白名单：数字 id（推荐，不会变且无需额外 API 调用）或 username，
+# 逗号分隔。默认空 —— 由 workflow 从 secret 注入，避免公开仓库暴露采集源。
+TG_SENDER = os.environ.get("TG_SENDER", "").strip()
 
 STATE_FILE = os.environ.get("STATE_FILE", "dmit_ports_state.json")
 OUT_FILE = os.environ.get("OUT_FILE", "dmit_ports_pool.txt")
@@ -117,7 +119,7 @@ async def collect_messages(client, chat, min_id):
         if search:
             kwargs["search"] = search
 
-        # 发送者白名单：数字 id 直接比对 sender_id，username 才需要拉 sender
+        # 数字 id 直接比对 sender_id；username 才需要额外拉 sender
         allow_ids, allow_names = set(), set()
         for tok in (TG_SENDER or "").split(","):
             tok = tok.strip().lstrip("@")
@@ -159,16 +161,15 @@ async def collect_messages(client, chat, min_id):
                 rows.append(got)
 
         if skipped:
-            print(f"[*] 按发送者过滤掉 {skipped} 条（非 bot）", flush=True)
+            print(f"[*] 按发送者过滤掉 {skipped} 条", flush=True)
         return rows, newest, seen
 
     if TG_SEARCH:
         rows, newest, seen = await _run(TG_SEARCH)
         if rows:
-            print(f"[*] 服务端搜索「{TG_SEARCH}」：遍历 {seen} 条，"
-                  f"命中 {len(rows)} 条", flush=True)
-            return rows, newest, f"search:{TG_SEARCH}"
-        print(f"[!] 搜索「{TG_SEARCH}」无命中，回退全量遍历", flush=True)
+            print(f"[*] 服务端搜索：遍历 {seen} 条，命中 {len(rows)} 条", flush=True)
+            return rows, newest, "search"
+        print(f"[!] 服务端搜索无命中，回退全量遍历", flush=True)
 
     rows, newest, seen = await _run(None)
     print(f"[*] 全量遍历：读 {seen} 条，命中 {len(rows)} 条", flush=True)
@@ -208,14 +209,15 @@ async def main():
         chat = await client.get_entity(chat_ref)
     except Exception as e:
         me = await client.get_me()
-        print(f"[ERR] get_entity failed: {raw_chat} | {type(e).__name__}: {e}")
+        print(f"[ERR] get_entity failed | {type(e).__name__}: {e}")
         print(f"[DIAG] account id={me.id}, username={getattr(me, 'username', None)}")
         await client.disconnect()
         raise
 
     limit_desc = "不限（完整历史）" if TG_FETCH_LIMIT <= 0 else f"{TG_FETCH_LIMIT:,} 条"
+    sender_desc = "已启用" if TG_SENDER else "未设置（仅靠内容特征过滤）"
     print(f"[*] 起点 msg_id={last_msg_id} | 抓取上限={limit_desc} | "
-          f"发送者={TG_SENDER or '(不限)'}", flush=True)
+          f"发送者白名单={sender_desc}", flush=True)
 
     rows, newest_msg_id, mode = await collect_messages(client, chat, last_msg_id)
     await client.disconnect()
