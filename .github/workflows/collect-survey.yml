@@ -1,10 +1,11 @@
 name: Collect Survey (dry-run)
 
-# 纯调查：不扫描、不写 state、不推私库、不发 TG。
-#   步骤一 统计 TG 群里 bot 消息的各 ASN 端口分布
+# ⚠️ 临时工具，勿加 schedule。
+# 纯调查：全程 DRY_RUN=1，不写 state、不下载 CSV、不推私库、不发 TG。
+#   步骤一 统计 TG 群发布消息的各 ASN 端口分布
 #   步骤二 列出频道 CSV 文件清单（只列不下载）
 #   步骤三 补上各 ASN 的 IPv4 规模，估算耗时并分层
-# 用完可以删掉这个文件。
+# 用完可删本文件，但保留 survey_asn_ips.py —— 以后重新评估 ASN 还要用。
 
 on:
   workflow_dispatch:
@@ -45,13 +46,13 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
           TG_SOURCE_CHAT: ${{ secrets.TG_SOURCE_CHAT }}
+          TG_SENDER: ${{ secrets.TG_SENDER }}
           TG_FETCH_LIMIT: ${{ inputs.fetch_limit }}
           STATE_FILE: "survey_state.json"
           SURVEY_OUT: "survey_asns.json"
           DRY_RUN: "1"
         run: python collect_dmit_ports.py
 
-      # 只列清单不下载：先看 43 个文件里带 AS 号的有几个，再决定要不要解析
       - name: Survey CSV files (TG channel)
         continue-on-error: true
         env:
