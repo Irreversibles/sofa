@@ -45,21 +45,10 @@ jobs:
           git clone --depth 1 \
             "https://x-access-token:${RESULT_REPO_TOKEN}@github.com/Irreversibles/proxyip.git" \
             private_repo
-          mkdir -p state
           if [ -f private_repo/dmit_ports_state.json ]; then
             cp private_repo/dmit_ports_state.json ./dmit_ports_state.json
             echo "[*] 已拉取现有 state"
-            python -c "
-import json
-d=json.load(open('dmit_ports_state.json'))
-a=d.get('asns') or {}
-if a:
-    print(f'[*] 当前 v3 档案: {len(a)} 个 ASN')
-    for k in sorted(a, key=lambda x: -len(a[x].get('ports',{})))[:5]:
-        print(f'      AS{k}: {len(a[k].get(\"ports\",{}))} 端口')
-else:
-    print(f'[*] 当前旧格式档案: {len(d.get(\"ports\") or {})} 端口（将迁移到 v3）')
-"
+            python inspect_state.py ./dmit_ports_state.json || true
           else
             echo "[!] 私库没有 state，将新建"
           fi
@@ -89,7 +78,7 @@ else:
           DRY_RUN: ${{ inputs.dry_run }}
         run: python collect_csv_ports.py
 
-      # 只算不扫：看配额/cycle/cadence 是否合理。不写 GITHUB_ENV 也无妨
+      # 只算不扫：看配额/cycle/cadence 是否合理
       - name: Build plan (dry, no scan)
         env:
           STATE_FILE: "dmit_ports_state.json"
@@ -104,21 +93,10 @@ else:
           echo "===== 端口池抽样（前 40 行）====="
           head -40 dmit_ports_pool.txt || true
           echo "===== 可疑端口检查 ====="
-          python - <<'PY'
-          import json
-          d = json.load(open('dmit_ports_state.json'))
-          for asn, b in sorted(d.get('asns', {}).items(),
-                               key=lambda kv: -len(kv[1].get('ports', {})))[:8]:
-              ports = sorted(int(p) for p in b.get('ports', {}))
-              low = [p for p in ports if p < 1024]
-              print(f"AS{asn}: {len(ports)} 端口 | 低位(<1024): {low}")
-              print(f"        范围 {ports[0]}-{ports[-1]}" if ports else "        空")
-          PY
+          python inspect_state.py ./dmit_ports_state.json --check-low
 
       - name: Push state to private repo
         if: inputs.dry_run != '1'
-        env:
-          RESULT_REPO_TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           cp dmit_ports_state.json private_repo/
           cp dmit_ports_pool.txt private_repo/ 2>/dev/null || true
