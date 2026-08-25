@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-TG 端口档案的读写与格式迁移，collect_ 和 build_ 共用。
+TG 端口档案的读写与格式迁移，各采集/构建脚本共用。
 
 v3 起按 ASN 分组：一个 state 文件容纳多家服务商的端口档案。
-    {"version":3, "last_msg_id":N, "asns":{"906":{...}, "16509":{...}}}
+    {"version":3, "last_msg_id":N, "csv_seen_ids":[...],
+     "asns":{"906":{...}, "16509":{...}}}
 每个 ASN 桶自带 ports / pending_selected / last_scan_ts / throughput_ema
 / ip_count_seen —— 这些都是按服务商独立的（IP 数、网络状况、轮转进度都不同）。
-last_msg_id 是全局的，因为只有一个 TG 群、一个游标。
+last_msg_id 和 csv_seen_ids 是全局的，因为只有一个群、一个频道、一套游标。
 
 state 多方共写，读写必须"合并式"：原样保留其它字段，只更新自己负责的：
     collect_dmit_ports.py → last_msg_id / asns.*.ports.{count,first_seen,last_seen}
+    collect_csv_ports.py  → csv_seen_ids / asns.*.ports.{count,first_seen,last_seen}
     build_dmit_ports.py   → asns.<ASN>.{ports.last_scanned, pending_selected,
                                         last_scan_ts, throughput_ema, ip_count_seen}
 """
@@ -25,7 +27,8 @@ def now_ts():
 
 
 def _empty():
-    return {"version": STATE_VERSION, "last_msg_id": 0, "asns": {}}
+    return {"version": STATE_VERSION, "last_msg_id": 0,
+            "csv_seen_ids": [], "asns": {}}
 
 
 def blank_asn(label=""):
@@ -88,6 +91,10 @@ def _fix_bucket(raw, label_fallback=""):
     return b
 
 
+def _fix_seen_ids(raw):
+    return sorted({int(x) for x in (raw or []) if str(x).isdigit()})
+
+
 def _migrate(data):
     """v1（ports 是 list）/ v2（ports 是 dict）→ v3（按 ASN 分组）"""
     if "asns" not in data:
@@ -103,6 +110,7 @@ def _migrate(data):
         out = {
             "version": STATE_VERSION,
             "last_msg_id": int(data.get("last_msg_id", 0) or 0),
+            "csv_seen_ids": _fix_seen_ids(data.get("csv_seen_ids")),
             "asns": {"906": bucket},
         }
         print(f"[migrate] -> v3: 旧档案 {len(bucket['ports'])} 个端口归入 AS906",
@@ -120,6 +128,7 @@ def _migrate(data):
     data["asns"] = fixed
     data["version"] = STATE_VERSION
     data["last_msg_id"] = int(data.get("last_msg_id", 0) or 0)
+    data["csv_seen_ids"] = _fix_seen_ids(data.get("csv_seen_ids"))
     # 清掉 v2 残留的顶层字段（已并入 906 桶）
     for k in ("ports", "pending_selected", "last_scan_ts",
               "throughput_ema", "ip_count_seen"):
