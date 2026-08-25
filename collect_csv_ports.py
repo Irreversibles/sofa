@@ -119,11 +119,39 @@ async def main():
     client = TelegramClient(session_name, TG_API_ID, TG_API_HASH)
     await client.start()
 
+    async def resolve_chat(raw):
+        """Telegram ID 体系：频道/超级群的 peer id 需要 -100 前缀，
+        纯数字会被当成 user_id（报 PeerUser 找不到）。所以依次尝试
+        原值、加 -100 前缀、去 -100 前缀。"""
+        cands = []
+        s = raw.strip()
+        if s.lstrip("-").isdigit():
+            n = int(s)
+            cands.append(n)
+            if n > 0:
+                cands.append(int(f"-100{n}"))
+            elif s.startswith("-100"):
+                cands.append(int(s[4:]))
+        else:
+            cands.append(s.lstrip("@"))
+
+        last_err = None
+        for c in cands:
+            try:
+                ent = await client.get_entity(c)
+                print(f"[*] 解析实体成功: {c}", flush=True)
+                return ent
+            except Exception as e:
+                last_err = e
+                print(f"[!] 尝试 {c} 失败: {type(e).__name__}", flush=True)
+        raise last_err
+
     try:
-        ref = int(TG_FILE_CHAT) if TG_FILE_CHAT.lstrip("-").isdigit() else TG_FILE_CHAT
-        chat = await client.get_entity(ref)
+        chat = await resolve_chat(TG_FILE_CHAT)
     except Exception as e:
-        print(f"[ERR] get_entity failed: {TG_FILE_CHAT} | {type(e).__name__}: {e}")
+        print(f"[ERR] 无法解析 TG_FILE_CHAT | {type(e).__name__}: {e}", flush=True)
+        print("[HINT] 频道请填 username（如 danfeng2）或带 -100 前缀的 id"
+              "（如 -1002764001836）", flush=True)
         await client.disconnect()
         raise
 
