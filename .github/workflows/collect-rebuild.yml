@@ -1,7 +1,9 @@
 name: Collect Rebuild (no scan)
 
-# 一次性：把 TG 群 + 频道 CSV 的端口全量重建进 state，只采集不扫描。
-# 会真实写 state 并推私库。跑完确认数字无误后删掉这个文件。
+# ⚠️ 临时工具，勿加 schedule。
+# dry_run=0 时会真实写 dmit_ports_state.json 并推私库；若被定时触发，
+# 会和 Scan-DMIT.yml 争抢同一份 state（同文件 JSON 冲突，rebase 解不了）。
+# 一次性重建端口档案用，确认 state 无误后可删掉本文件。
 
 on:
   workflow_dispatch:
@@ -59,6 +61,7 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
           TG_SOURCE_CHAT: ${{ secrets.TG_SOURCE_CHAT }}
+          TG_SENDER: ${{ secrets.TG_SENDER }}
           STATE_FILE: "dmit_ports_state.json"
           OUT_FILE: "dmit_ports_pool.txt"
           TG_FETCH_LIMIT: "0"
