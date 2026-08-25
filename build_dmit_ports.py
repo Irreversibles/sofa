@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-决定本轮扫哪些端口、以及本轮到底跑不跑。
+决定本轮扫哪些端口、以及本轮到底跑不跑。按 ASN 环境变量选对应档案分组。
 
-严格覆盖优先（本次核心）：
-    只要池子里还有没扫过的端口(last_scanned==0)，就只从未扫端口里选，
-    绝不复扫 —— 哪怕配额没用满。只有整个池子都扫过一遍后，才进入复扫
-    阶段（最久没扫的优先）。频次不再是插队重扫的理由，只在"同为未扫"
-    时决定谁先扫。这样保证：一圈没走完前，任何端口都不会被重复扫。
-
+严格覆盖优先：只要池子里还有没扫过的端口(last_scanned==0)，就只从未扫
+    端口里选，绝不复扫 —— 哪怕配额没用满。只有整个池子都扫过一遍后，
+    才进入复扫（最久没扫的优先）。保证一圈没走完前任何端口不被重复扫。
+    频次不再是插队重扫的理由，只在"同为未扫"时决定谁先扫。
 配额：按时间预算反推，用实测吞吐(EMA)自校准。
 节奏：按 cycle（轮转一圈需要几轮）自适应。
 截断：被闸门截断而没扫全的端口不标记已扫，下轮自动优先补。
@@ -23,7 +21,7 @@ import os
 import sys
 import urllib.request
 
-from port_state import load_state, save_state, now_ts
+from port_state import load_state, save_state, now_ts, get_bucket
 
 STATE_FILE = os.environ.get("STATE_FILE", "dmit_ports_state.json")
 ASN = os.environ.get("ASN", "906").replace("AS", "").strip()
@@ -31,7 +29,7 @@ ASN = os.environ.get("ASN", "906").replace("AS", "").strip()
 DEFAULT_PORTS = os.environ.get("DEFAULT_PORTS", "443,8443,2053,2083,2096")
 
 SCAN_BUDGET_MIN = float(os.environ.get("SCAN_BUDGET_MIN", "170"))
-TCP_THROUGHPUT_INIT = float(os.environ.get("TCP_THROUGHPUT", "22000"))
+TCP_THROUGHPUT_INIT = float(os.environ.get("TCP_THROUGHPUT", "60000"))
 THROUGHPUT_SAFETY = float(os.environ.get("THROUGHPUT_SAFETY", "0.85"))
 EMA_ALPHA = float(os.environ.get("EMA_ALPHA", "0.5"))
 PORTS_MIN_TOTAL = int(os.environ.get("PORTS_MIN_TOTAL", "10"))
@@ -99,6 +97,7 @@ def count_asn_ips(asn):
     if not nets:
         return 0
     total = 0
+    # collapse 掉重叠/相邻前缀，否则 BGP 里 /15 和 /16 同时宣告会重复计数
     for net in ipaddress.collapse_addresses(nets):
         n = net.num_addresses
         total += n if net.prefixlen >= 31 else max(0, n - 2)
@@ -117,6 +116,7 @@ def write_env(pairs):
 
 
 def interval_for_cycle(cycle):
+    """轮转一圈要的轮数越多 → 扫得越频繁，避免覆盖周期拖太长"""
     if cycle <= 1:
         return CADENCE_1
     if cycle <= 3:
@@ -142,15 +142,16 @@ def _read_metrics():
 
 def finalize():
     st = load_state(STATE_FILE)
+    b = get_bucket(st, ASN)
     ts = now_ts()
 
     # --- 只标记"真正扫完"的端口，被截断的保持旧 last_scanned 以便下轮优先 ---
     done = _read_done_ports()
-    pend = [int(p) for p in st.get("pending_selected", []) if str(p).isdigit()]
+    pend = [int(p) for p in b.get("pending_selected", []) if str(p).isdigit()]
     mark = pend if done is None else [p for p in pend if p in set(done)]
     n = 0
     for p in mark:
-        rec = st["ports"].get(str(p))
+        rec = b["ports"].get(str(p))
         if rec is not None:
             rec["last_scanned"] = ts
             n += 1
@@ -160,16 +161,16 @@ def finalize():
     m = _read_metrics()
     measured = float(m.get("tcp_throughput_per_min", 0) or 0)
     if measured > 0:
-        prev = float(st.get("throughput_ema", 0) or 0)
+        prev = float(b.get("throughput_ema", 0) or 0)
         new_ema = measured if prev <= 0 else EMA_ALPHA * measured + (1 - EMA_ALPHA) * prev
-        st["throughput_ema"] = round(new_ema, 1)
-        print(f"[OK] 吞吐 EMA: {prev:,.0f} + 实测 {measured:,.0f} "
+        b["throughput_ema"] = round(new_ema, 1)
+        print(f"[OK] AS{ASN} 吞吐 EMA: {prev:,.0f} + 实测 {measured:,.0f} "
               f"-> {new_ema:,.0f} 目标/分钟", flush=True)
 
-    st["pending_selected"] = []
-    st["last_scan_ts"] = ts
+    b["pending_selected"] = []
+    b["last_scan_ts"] = ts
     save_state(STATE_FILE, st)
-    print(f"[OK] finalize: 标记已扫 {n} 个"
+    print(f"[OK] finalize AS{ASN}: 标记已扫 {n} 个"
           f"{f'，截断未扫 {skipped} 个（下轮优先补）' if skipped else ''}，"
           f"last_scan_ts={ts}", flush=True)
 
@@ -180,12 +181,14 @@ def main():
         return
 
     st = load_state(STATE_FILE)
-    ports = st["ports"]
+    b = get_bucket(st, ASN)
+    ports = b["ports"]
     default_ports = sorted(parse_ports(DEFAULT_PORTS))
     default_set = set(default_ports)
 
+    # IP 数：实时拉取，但异常缩水时沿用历史缓存，避免配额被错误放大
     fetched = count_asn_ips(ASN)
-    prev = int(st.get("ip_count_seen", 0) or 0)
+    prev = int(b.get("ip_count_seen", 0) or 0)
     if fetched <= 0:
         ip_count = prev
         src = "历史缓存（本次拉取失败）"
@@ -195,13 +198,13 @@ def main():
     else:
         ip_count = fetched
         src = "实时拉取"
-        st["ip_count_seen"] = fetched
+        b["ip_count_seen"] = fetched
     if ip_count <= 0:
         ip_count = 80000
         src = "兜底估值"
     print(f"[*] AS{ASN} IP 数: {ip_count:,}（{src}）", flush=True)
 
-    ema = float(st.get("throughput_ema", 0) or 0)
+    ema = float(b.get("throughput_ema", 0) or 0)
     if ema > 0:
         thr = ema * THROUGHPUT_SAFETY
         thr_src = f"EMA {ema:,.0f}×{THROUGHPUT_SAFETY}"
@@ -252,12 +255,12 @@ def main():
     merged = sorted(default_set | set(selected))
     merged_str = ",".join(str(p) for p in merged)
 
-    st["pending_selected"] = selected
+    b["pending_selected"] = selected
     save_state(STATE_FILE, st)
 
     cycle = math.ceil(len(pool) / max(1, extra_quota)) if extra_quota > 0 else 1
     interval = interval_for_cycle(cycle)
-    last_scan_ts = int(st.get("last_scan_ts", 0) or 0)
+    last_scan_ts = int(b.get("last_scan_ts", 0) or 0)
     elapsed_days = (now_ts() - last_scan_ts) / 86400.0 if last_scan_ts else 1e9
 
     if FORCE_RUN:
@@ -273,8 +276,8 @@ def main():
     real_thr = ema if ema > 0 else TCP_THROUGHPUT_INIT
     est_min = (ip_count * len(merged)) / real_thr
 
-    print(f"[*] 档案 {len(ports)} 端口（可轮转 {len(pool)}，未扫 {len(unscanned)}，"
-          f"已扫 {len(scanned)}）", flush=True)
+    print(f"[*] AS{ASN} 档案 {len(ports)} 端口（可轮转 {len(pool)}，"
+          f"未扫 {len(unscanned)}，已扫 {len(scanned)}）", flush=True)
     print(f"[*] 阶段={phase} | 本轮: 默认 {len(default_ports)} + 新扫 {new_sel} "
           f"+ 复扫 {rescan_sel} = {len(merged)} 端口"
           f"（待覆盖剩余 {remaining_unscanned}）", flush=True)
