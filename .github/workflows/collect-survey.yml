@@ -1,28 +1,27 @@
 name: Collect Survey (dry-run)
 
-# 只做 ASN 端口分布调查：不扫描、不写 state、不推私库、不发 TG。
+# 纯调查：不扫描、不写 state、不推私库、不发 TG。
+#   步骤一 统计 TG 群里 bot 消息的各 ASN 端口分布
+#   步骤二 列出频道 CSV 文件清单（只列不下载）
+#   步骤三 补上各 ASN 的 IPv4 规模，估算耗时并分层
 # 用完可以删掉这个文件。
 
 on:
   workflow_dispatch:
     inputs:
       fetch_limit:
-        description: '回读条数，0=不限（读完整历史）'
+        description: 'TG 消息回读条数，0=不限（读完整历史）'
         required: false
         default: '0'
-      search:
-        description: '服务端搜索关键词，留空则全量遍历'
+      asn_extra:
+        description: '额外要查 IP 数的 ASN（逗号分隔，可留空）'
         required: false
-        default: '#CF优选IP'
-      sender:
-        description: 'bot 发送者 id/username，留空=不限发送者'
-        required: false
-        default: '8297124834'
+        default: ''
 
 jobs:
   survey:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: read
 
@@ -40,18 +39,48 @@ jobs:
 
       # 故意不拉 state：last_msg_id=0 → 从最新往回读完整历史。
       # 若拉了 state，游标已推进过，只能看到增量几条，统计没意义。
-      - name: Survey ASN distribution
+      - name: Survey ASN port distribution (TG group)
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
           TG_SOURCE_CHAT: ${{ secrets.TG_SOURCE_CHAT }}
           TG_FETCH_LIMIT: ${{ inputs.fetch_limit }}
-          TG_SEARCH: ${{ inputs.search }}
-          TG_SENDER: ${{ inputs.sender }}
           STATE_FILE: "survey_state.json"
+          SURVEY_OUT: "survey_asns.json"
           DRY_RUN: "1"
         run: python collect_dmit_ports.py
+
+      # 只列清单不下载：先看 43 个文件里带 AS 号的有几个，再决定要不要解析
+      - name: Survey CSV files (TG channel)
+        continue-on-error: true
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
+          TG_FILE_CHAT: ${{ secrets.TG_FILE_CHAT }}
+          STATE_FILE: "survey_state.json"
+          DRY_RUN: "1"
+        run: python collect_csv_ports.py
+
+      - name: Survey ASN IPv4 scale
+        env:
+          SURVEY_FILE: "survey_asns.json"
+          ASN_EXTRA: ${{ inputs.asn_extra }}
+          SCAN_BUDGET_MIN: "170"
+        run: python survey_asn_ips.py
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asn-survey
+          path: |
+            survey_asns.json
+            asn_ip_report.txt
+            asn_ip_report.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Cleanup
         if: always()
