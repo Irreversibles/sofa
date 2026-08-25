@@ -1,12 +1,23 @@
 name: Collect Survey (dry-run)
 
+# 只做 ASN 端口分布调查：不扫描、不写 state、不推私库、不发 TG。
+# 用完可以删掉这个文件。
+
 on:
   workflow_dispatch:
     inputs:
       fetch_limit:
-        description: '回读消息条数'
+        description: '回读条数，0=不限（读完整历史）'
         required: false
-        default: '20000'
+        default: '0'
+      search:
+        description: '服务端搜索关键词，留空则全量遍历'
+        required: false
+        default: '#CF优选IP'
+      sender:
+        description: 'bot 发送者 id/username，留空=不限发送者'
+        required: false
+        default: '8297124834'
 
 jobs:
   survey:
@@ -27,8 +38,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install telethon
 
-      # 不拉 state：last_msg_id=0 → 从最新往回读满 limit 条完整历史
-      # DRY_RUN=1 → 只统计不写文件，无任何推送
+      # 故意不拉 state：last_msg_id=0 → 从最新往回读完整历史。
+      # 若拉了 state，游标已推进过，只能看到增量几条，统计没意义。
       - name: Survey ASN distribution
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -36,6 +47,8 @@ jobs:
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
           TG_SOURCE_CHAT: ${{ secrets.TG_SOURCE_CHAT }}
           TG_FETCH_LIMIT: ${{ inputs.fetch_limit }}
+          TG_SEARCH: ${{ inputs.search }}
+          TG_SENDER: ${{ inputs.sender }}
           STATE_FILE: "survey_state.json"
           DRY_RUN: "1"
         run: python collect_dmit_ports.py
