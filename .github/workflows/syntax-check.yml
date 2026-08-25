@@ -1,0 +1,92 @@
+name: Syntax Check
+
+on:
+  push:
+    paths:
+      - '**.py'
+      - '.github/workflows/**.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: syntax-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: pip install pyyaml==6.0.2
+
+      # 只做静态解析：不联网、不执行脚本逻辑、不产生 .pyc
+      - name: Check Python + YAML syntax
+        id: check
+        continue-on-error: true
+        run: |
+          python - <<'PY' | tee syntax_report.txt
+          import pathlib, sys
+          try:
+              import yaml
+          except ImportError:
+              yaml = None
+
+          bad = []
+
+          for p in sorted(pathlib.Path('.').rglob('*.py')):
+              if '.git' in p.parts:
+                  continue
+              try:
+                  compile(p.read_text(encoding='utf-8'), str(p), 'exec')
+              except SyntaxError as e:
+                  bad.append(f"{p}:{e.lineno} {type(e).__name__}: {e.msg}")
+              except Exception as e:
+                  bad.append(f"{p} {type(e).__name__}: {e}")
+
+          if yaml:
+              for p in sorted(pathlib.Path('.github/workflows').rglob('*.yml')):
+                  try:
+                      yaml.safe_load(p.read_text(encoding='utf-8'))
+                  except Exception as e:
+                      line = getattr(getattr(e, 'problem_mark', None), 'line', None)
+                      loc = f":{line + 1}" if line is not None else ""
+                      bad.append(f"{p}{loc} YAMLError: {getattr(e, 'problem', e)}")
+
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print("OK")
+          PY
+
+      - name: Notify TG on failure
+        if: steps.check.outcome == 'failure'
+        run: |
+          DETAIL=$(head -c 1200 syntax_report.txt 2>/dev/null || echo "(无详情)")
+          MSG="🚨 语法检查失败
+          仓库: ${{ github.repository }}
+          分支: ${{ github.ref_name }}
+          提交: ${{ github.event.head_commit.message || 'manual' }}
+
+          ${DETAIL}
+
+          详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TG_CHAT_ID }}" \
+            --data-urlencode "text=${MSG}" > /dev/null
+
+      # 让整个 job 红叉，Actions 页面也能一眼看到
+      - name: Fail the job
+        if: steps.check.outcome == 'failure'
+        run: exit 1
