@@ -570,10 +570,10 @@ async def main():
     target_input = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET
     name_arg = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
     if not CHECK_API:
-    print("[-] CHECK_API 未配置，退出。", flush=True)
-    with open("count.txt", "w", encoding="utf-8") as f:
-        f.write("0")
-    return
+        print("[-] CHECK_API 未配置，退出。", flush=True)
+        with open("count.txt", "w", encoding="utf-8") as f:
+            f.write("0")
+        return
 
     asn_list = parse_asn_list(target_input)
     if not asn_list:
