@@ -1,4 +1,4 @@
-name: Scan DMIT (AS906 masscan + budget-driven + cycle cadence)
+name: Scan DMIT (AS906+AS32519 masscan + budget-driven + cycle cadence)
 
 on:
   workflow_dispatch:
@@ -54,10 +54,12 @@ jobs:
         run: python collect_dmit_ports.py
 
       # 选端口 + 决策 SHOULD_RUN（手动触发时强制跑）
+      # ASN 支持逗号分隔多值：906 和 32519 都是 DMIT，共用一条线、
+      # 一份端口池；build 会合并两桶的端口，扫描器会合并两者的 IP 段
       - name: Build port list + cadence decision
         env:
           STATE_FILE: "dmit_ports_state.json"
-          ASN: "906"
+          ASN: "906,32519"
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           SCAN_BUDGET_MIN: "170"
           TCP_THROUGHPUT: "60000"
@@ -71,6 +73,7 @@ jobs:
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python build_dmit_ports.py
 
+      # 扫描目标用 build 写出的 SCAN_TARGET，以后增减 ASN 只改上面的 ASN 即可
       - name: Run Scan
         id: scan
         if: env.SHOULD_RUN == 'true'
@@ -83,14 +86,15 @@ jobs:
           MASSCAN_RETRIES: "2"
           MASSCAN_WAIT: "5"
         run: |
-          echo "[INFO] scan_port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
-          python check_cf_asn_masscan_dmit.py "906" "DMIT" "${MERGED_PORTS}"
+          echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
+          python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "DMIT" "${MERGED_PORTS}"
 
       # 只有真正扫成功才推进轮转（读 scan_done_ports.txt）+ EMA 校准吞吐
       - name: Finalize port rotation
         if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
           STATE_FILE: "dmit_ports_state.json"
+          ASN: "906,32519"
         run: python build_dmit_ports.py --finalize
 
       # state 无条件推送：跳过扫描也要保住收集成果和轮转进度
@@ -202,11 +206,11 @@ jobs:
           [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全，剩余下轮优先补"
 
           if [ "${{ job.status }}" != "success" ]; then
-            MSG="❌ 扫描失败%0A服务商: DMIT (AS906)%0A状态: ${{ job.status }}"
+            MSG="❌ 扫描失败%0A服务商: DMIT (AS906+32519)%0A状态: ${{ job.status }}"
           elif [ "${SHOULD_RUN:-false}" != "true" ]; then
-            MSG="⏭️ 本次跳过%0A服务商: DMIT (AS906)%0A端口档案: ${POOL_COUNT:-?}%0A阶段: ${SWEEP_PHASE:-?}（待覆盖 ${REMAINING_UNSCANNED:-?}）%0A间隔 ${CADENCE_DAYS:-?} 天"
+            MSG="⏭️ 本次跳过%0A服务商: DMIT (AS906+32519)%0A端口档案: ${POOL_COUNT:-?}%0A阶段: ${SWEEP_PHASE:-?}（待覆盖 ${REMAINING_UNSCANNED:-?}）%0A间隔 ${CADENCE_DAYS:-?} 天"
           else
-            MSG="✅ 扫描完成%0A服务商: DMIT (AS906)%0A端口: ${MERGED_PORTS_COUNT:-?}（默认5 + 新扫 ${NEW_COUNT:-?} + 复扫 ${RESCAN_COUNT:-?}）%0A阶段: ${SWEEP_PHASE:-?}（池 ${POOL_COUNT:-?}，待覆盖 ${REMAINING_UNSCANNED:-?}）%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天%0A本次新增: ${COUNT} 个${WARN}"
+            MSG="✅ 扫描完成%0A服务商: DMIT (AS906+32519)%0A端口: ${MERGED_PORTS_COUNT:-?}（默认5 + 新扫 ${NEW_COUNT:-?} + 复扫 ${RESCAN_COUNT:-?}）%0A阶段: ${SWEEP_PHASE:-?}（池 ${POOL_COUNT:-?}，待覆盖 ${REMAINING_UNSCANNED:-?}）%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天%0A本次新增: ${COUNT} 个${WARN}"
           fi
 
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
