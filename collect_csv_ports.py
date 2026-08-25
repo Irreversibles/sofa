@@ -43,8 +43,12 @@ FILE_FETCH_LIMIT = int(os.environ.get("FILE_FETCH_LIMIT", "0"))   # 0=不限
 MAX_FILE_MB = float(os.environ.get("MAX_FILE_MB", "2"))           # 超过则跳过
 MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "50"))
 
-# 文件名里的 AS 号：要求 AS 紧跟数字，避开日期串（20260811）误匹配
-FNAME_ASN_RE = re.compile(r"\bAS(\d{1,10})\b", re.IGNORECASE)
+# 文件名里的 AS 号。不能用 \bAS(\d+)\b —— AS932_XNNET 里数字和下划线
+# 之间不构成单词边界，会匹配失败（只有 AS25820.csv 那种后跟 . 的能过）。
+# 改成"前面不是字母数字 + AS + 数字 + 后面不跟数字"，兼容
+# AS932_XNNET / AS25820.csv / AS149440_EVOX...；日期串 20260609 前面
+# 没有 AS，不会被误当 AS 号。
+FNAME_ASN_RE = re.compile(r"(?:^|[^A-Za-z0-9])AS(\d{1,10})(?!\d)", re.IGNORECASE)
 
 ASN_BLACKLIST = {"13335", "209242"}      # CF 自家，扫了没意义
 for x in (os.environ.get("ASN_BLACKLIST_EXTRA", "") or "").replace(" ", "").split(","):
