@@ -48,6 +48,7 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
           TG_SOURCE_CHAT: ${{ secrets.TG_SOURCE_CHAT }}
+          TG_SENDER: ${{ secrets.TG_SENDER }}
           TG_FETCH_LIMIT: "5000"
           STATE_FILE: "dmit_ports_state.json"
           OUT_FILE: "dmit_ports_pool.txt"
@@ -55,7 +56,7 @@ jobs:
 
       # 选端口 + 决策 SHOULD_RUN（手动触发时强制跑）
       # ASN 支持逗号分隔多值：906 和 32519 都是 DMIT，共用一条线、
-      # 一份端口池；build 会合并两桶的端口，扫描器会合并两者的 IP 段
+      # 一份端口池；build 合并两桶的端口，扫描器合并两者的 IP 段
       - name: Build port list + cadence decision
         env:
           STATE_FILE: "dmit_ports_state.json"
@@ -90,6 +91,7 @@ jobs:
           python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "DMIT" "${MERGED_PORTS}"
 
       # 只有真正扫成功才推进轮转（读 scan_done_ports.txt）+ EMA 校准吞吐
+      # ASN 必须和 build 一致，否则 32519 桶的 last_scanned 标记不上
       - name: Finalize port rotation
         if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
