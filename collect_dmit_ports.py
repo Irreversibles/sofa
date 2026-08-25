@@ -8,6 +8,11 @@
      GitHub 曝光检测报告等非 IP 消息，那些没这个标签
   3) 必须有 IP地址 和 端口 字段 —— 群友带标签的闲聊在此被挡
 
+分桶键只接受纯数字 AS 号。少数消息的 ASN编号 字段异常（正则会抓到下一行
+的运营商名），这类整条丢弃 —— 比造一堆名字键干净。
+CF 自家 ASN（13335 / 209242）在黑名单里：那些 IP 本身就是 CF 边缘，
+不是 proxyip 后端，扫了没意义。
+
 抓取策略：优先用 Telegram 服务端搜索只拉带标签的消息（省几个数量级流量），
 因此默认不限条数、读完整历史。搜索若取不到结果（CJK/话题标签偶有翻车）
 自动回退全量遍历 + 本地过滤，不会静默漏数据。
@@ -15,19 +20,16 @@
 频次是价值信号：同一端口被反复发布说明多个客户在用，命中概率更高，
 所以档案记 count，由 build_dmit_ports.py 用来排序。
 
-分桶键取自 ASN编号 字段：能解析出 AS 号就用数字（如 "906"），
-只有名字则查别名表，查不到用名字大写做键。
-别名表可用 ASN_ALIASES 环境变量扩充："DMIT=906,AWS=16509"
-
 模式：
-    DRY_RUN=1       只统计并打印分桶分布，不写 state（首次用它验证）
+    DRY_RUN=1       只统计并打印分桶分布 + 产出 survey_asns.json，不写 state
     FULL_REBUILD=1  游标归零、清空 count 后全量重读，重建真实频次；
                     last_scanned 会被保留，轮转进度不丢
 """
+import json
 import os
 import re
 import asyncio
-from collections import Counter
+from collections import Counter, defaultdict
 
 from telethon import TelegramClient
 
@@ -40,17 +42,23 @@ TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "")
 
 # 0 = 不限条数，读完整历史（配合服务端搜索，成本很低）
 TG_FETCH_LIMIT = int(os.environ.get("TG_FETCH_LIMIT", "0"))
-# 服务端搜索关键词；置空则直接全量遍历
 TG_SEARCH = os.environ.get("TG_SEARCH", "#CF优选IP")
-# 只认这个 bot 发的。留空 = 不限发送者，仅靠内容特征过滤。
-# 填数字 id（推荐，不会变且无需额外 API 调用）或 username（不带@），逗号分隔
+# 只认这个 bot 发的。数字 id 最稳，且不必额外调 get_sender
 TG_SENDER = os.environ.get("TG_SENDER", "8297124834").strip()
 
 STATE_FILE = os.environ.get("STATE_FILE", "dmit_ports_state.json")
 OUT_FILE = os.environ.get("OUT_FILE", "dmit_ports_pool.txt")
+SURVEY_OUT = os.environ.get("SURVEY_OUT", "survey_asns.json")
 
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 FULL_REBUILD = os.environ.get("FULL_REBUILD", "0") == "1"
+
+# CF 自家 ASN：那些 IP 是 CF 边缘本身，不是可用的 proxyip 后端
+ASN_BLACKLIST = {"13335", "209242"}
+for x in (os.environ.get("ASN_BLACKLIST_EXTRA", "") or "").replace(" ", "").split(","):
+    a = x.upper().replace("AS", "")
+    if a.isdigit():
+        ASN_BLACKLIST.add(a)
 
 TEMPLATE_RE = re.compile(r"#CF优选IP")
 
@@ -59,24 +67,9 @@ PORT_RE = re.compile(r"端口\s*[:：]\s*(\d{1,5})")
 ASN_LINE_RE = re.compile(r"ASN编号\s*[:：]\s*(.+)")
 AS_NUM_RE = re.compile(r"\bAS\s*(\d{1,10})\b", re.IGNORECASE)
 
-NAME_TO_ASN = {
-    "DMIT": "906",
-}
-for pair in (os.environ.get("ASN_ALIASES", "") or "").split(","):
-    if "=" in pair:
-        k, v = pair.split("=", 1)
-        k = re.sub(r"[^\w]+", "", k).strip().upper()
-        v = v.strip().upper().replace("AS", "")
-        if k and v:
-            NAME_TO_ASN[k] = v
-
-
-def _slug(s):
-    return re.sub(r"[^\w]+", "_", s).strip("_").upper()[:32]
-
 
 def asn_key_and_label(text):
-    """返回 (分桶键, 原始标签)。拿不到 ASN编号 行时返回 (None, "")。"""
+    """返回 (纯数字 AS 号, 原始标签)。解析不出数字 AS 号时返回 (None, 标签)。"""
     m = ASN_LINE_RE.search(text or "")
     if not m:
         return None, ""
@@ -84,25 +77,14 @@ def asn_key_and_label(text):
     if not raw:
         return None, ""
     label = raw[:60]
-
     num = AS_NUM_RE.search(raw)
     if num:
         return num.group(1), label
-
-    slug = _slug(raw)
-    if not slug:
-        return None, label
-    # 名字里可能夹着别的词（"DMIT 洛杉矶"），逐个 token 查别名
-    for token in slug.split("_"):
-        if token in NAME_TO_ASN:
-            return NAME_TO_ASN[token], label
-    if slug in NAME_TO_ASN:
-        return NAME_TO_ASN[slug], label
-    return slug, label
+    return None, label
 
 
 def extract(text):
-    """返回 (分桶键, 标签, 端口)，任一环节不成立则返回 None。"""
+    """返回 (AS号, 标签, 端口) 或 ('_BAD_ASN', 标签, 0) 或 None。"""
     if not text:
         return None
     text = text.replace("\u200b", "").replace("\ufeff", "")
@@ -118,7 +100,7 @@ def extract(text):
         return None
     key, label = asn_key_and_label(text)
     if not key:
-        return None
+        return ("_BAD_ASN", label, 0)
     return key, label, p
 
 
@@ -129,8 +111,7 @@ async def collect_messages(client, chat, min_id):
     支持不佳时静默漏数据。
     """
     async def _run(search):
-        kwargs = {}
-        kwargs["limit"] = TG_FETCH_LIMIT if TG_FETCH_LIMIT > 0 else None
+        kwargs = {"limit": TG_FETCH_LIMIT if TG_FETCH_LIMIT > 0 else None}
         if min_id > 0:
             kwargs["min_id"] = min_id
         if search:
@@ -234,19 +215,29 @@ async def main():
 
     limit_desc = "不限（完整历史）" if TG_FETCH_LIMIT <= 0 else f"{TG_FETCH_LIMIT:,} 条"
     print(f"[*] 起点 msg_id={last_msg_id} | 抓取上限={limit_desc} | "
-          f"发送者白名单={TG_SENDER or '(不限)'}", flush=True)
+          f"发送者={TG_SENDER or '(不限)'}", flush=True)
 
     rows, newest_msg_id, mode = await collect_messages(client, chat, last_msg_id)
     await client.disconnect()
 
     ts = now_ts()
     new_ports = 0
+    bad_asn = 0
+    blacklisted = 0
     bucket_hits = Counter()
     bucket_labels = {}
+    bucket_ports = defaultdict(set)
 
     for akey, label, p in rows:
+        if akey == "_BAD_ASN":
+            bad_asn += 1
+            continue
+        if akey in ASN_BLACKLIST:
+            blacklisted += 1
+            continue
         bucket_hits[akey] += 1
         bucket_labels.setdefault(akey, label)
+        bucket_ports[akey].add(p)
         if DRY_RUN:
             continue
         b = get_bucket(st, akey, label)
@@ -261,11 +252,23 @@ async def main():
 
     print(f"[OK] 抓取方式={mode} | 游标 {last_msg_id} -> {newest_msg_id} | "
           f"发布消息 {len(rows)} 条", flush=True)
-    print(f"[OK] 分桶分布（键 | 命中数 | 消息里的原始标签）：", flush=True)
+    if bad_asn:
+        print(f"[*] 丢弃 ASN编号 字段异常的 {bad_asn} 条", flush=True)
+    if blacklisted:
+        print(f"[*] 丢弃黑名单 ASN（CF 自家）的 {blacklisted} 条", flush=True)
+    print(f"[OK] 分桶分布（AS号 | 条数 | 去重端口 | 标签）：", flush=True)
     for akey, n in bucket_hits.most_common():
-        flag = "" if akey.isdigit() else "   <-- 没解析出 AS 号，考虑加 ASN_ALIASES"
-        print(f"      {akey:<12} {n:>6}  {bucket_labels.get(akey,'')}{flag}",
-              flush=True)
+        print(f"      {akey:<10}{n:>6}{len(bucket_ports[akey]):>6}  "
+              f"{bucket_labels.get(akey,'')}", flush=True)
+
+    # survey_asns.json 无论哪种模式都写，供 survey_asn_ips.py 补 IP 规模
+    survey = {a: {"hits": n,
+                  "ports": len(bucket_ports[a]),
+                  "label": bucket_labels.get(a, "")}
+              for a, n in bucket_hits.items()}
+    with open(SURVEY_OUT, "w", encoding="utf-8") as f:
+        json.dump(survey, f, ensure_ascii=False, indent=2, sort_keys=True)
+    print(f"[OK] 已写出 {SURVEY_OUT}（{len(survey)} 个 ASN）", flush=True)
 
     if DRY_RUN:
         print("[*] DRY_RUN：未写入 state", flush=True)
@@ -285,7 +288,7 @@ async def main():
 
     # 可读产物：按 ASN 分节列出 端口 频次（build 不依赖它，只读 state）
     with open(OUT_FILE, "w", encoding="utf-8", newline="\n") as f:
-        for akey in sorted(st["asns"], key=lambda k: (not k.isdigit(), k)):
+        for akey in sorted(st["asns"], key=lambda k: int(k) if k.isdigit() else 0):
             b = st["asns"][akey]
             f.write(f"# AS{akey} {b.get('label','')} ({len(b['ports'])} ports)\n")
             for pkey in sorted(b["ports"], key=lambda x: int(x)):
@@ -293,12 +296,10 @@ async def main():
 
     print(f"[OK] 新端口 {new_ports} 个 | 档案覆盖 {len(st['asns'])} 个 ASN",
           flush=True)
-    for akey in sorted(st["asns"], key=lambda k: -len(st["asns"][k]["ports"])):
+    for akey in sorted(st["asns"], key=lambda k: -len(st["asns"][k]["ports"]))[:15]:
         b = st["asns"][akey]
-        hot = sum(1 for v in b["ports"].values()
-                  if int(v.get("count", 1) or 1) >= 5)
-        print(f"      AS{akey:<10} {len(b['ports']):>4} 端口"
-              f"（频次≥5 的 {hot}）  {b.get('label','')}", flush=True)
+        print(f"      AS{akey:<10} {len(b['ports']):>4} 端口  "
+              f"{b.get('label','')}", flush=True)
 
 
 if __name__ == "__main__":
