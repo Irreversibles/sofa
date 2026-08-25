@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-DMIT 端口档案的读写与格式迁移，collect_ 和 build_ 共用。
+TG 端口档案的读写与格式迁移，collect_ 和 build_ 共用。
 
-state 是多方共写的，所以读写都必须是"合并式"——
-原样保留其它字段，只更新自己负责的那部分：
-    collect_dmit_ports.py → last_msg_id / ports.{count,first_seen,last_seen}
-    build_dmit_ports.py   → ports.last_scanned / pending_selected / ip_count_seen
+v3 起按 ASN 分组：一个 state 文件容纳多家服务商的端口档案。
+    {"version":3, "last_msg_id":N, "asns":{"906":{...}, "16509":{...}}}
+每个 ASN 桶自带 ports / pending_selected / last_scan_ts / throughput_ema
+/ ip_count_seen —— 这些都是按服务商独立的（IP 数、网络状况、轮转进度都不同）。
+last_msg_id 是全局的，因为只有一个 TG 群、一个游标。
+
+state 多方共写，读写必须"合并式"：原样保留其它字段，只更新自己负责的：
+    collect_dmit_ports.py → last_msg_id / asns.*.ports.{count,first_seen,last_seen}
+    build_dmit_ports.py   → asns.<ASN>.{ports.last_scanned, pending_selected,
+                                        last_scan_ts, throughput_ema, ip_count_seen}
 """
 import json
 import os
 import time
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 def now_ts():
@@ -19,56 +25,122 @@ def now_ts():
 
 
 def _empty():
-    return {"version": STATE_VERSION, "last_msg_id": 0, "ports": {}}
+    return {"version": STATE_VERSION, "last_msg_id": 0, "asns": {}}
 
 
-def _migrate(data):
-    """v1（ports 是扁平 list）→ v2（ports 是带频次的 dict）"""
-    ports = data.get("ports")
+def blank_asn(label=""):
+    return {
+        "label": label,
+        "ports": {},
+        "pending_selected": [],
+        "last_scan_ts": 0,
+        "throughput_ema": 0,
+        "ip_count_seen": 0,
+    }
 
+
+def _fix_ports(ports):
+    """把任意形态的 ports 规整成 {"端口": {count,first_seen,last_seen,last_scanned}}"""
+    fixed = {}
     if isinstance(ports, list):
         ts = now_ts()
-        newp = {}
         for x in ports:
             if str(x).isdigit():
                 p = int(x)
                 if 1 <= p <= 65535:
-                    newp[str(p)] = {"count": 1, "first_seen": ts,
-                                    "last_seen": ts, "last_scanned": 0}
-        data["ports"] = newp
-        # 游标字段废弃：extra_pool 是数值排序的，新端口插进中间会让游标
-        # 之后所有下标整体后移，游标指向的端口漂移、部分端口长期轮不到。
-        # 改用 last_scanned 排序后，池子怎么增删都不影响覆盖均匀性。
-        for k in ("extra_cursor", "last_selected_sig", "extra_pool_count",
-                  "extra_selected_count", "adaptive_max_extra"):
-            data.pop(k, None)
-        print(f"[migrate] v1 -> v2: {len(newp)} 个端口，频次初始化为 1", flush=True)
+                    fixed[str(p)] = {"count": 1, "first_seen": ts,
+                                     "last_seen": ts, "last_scanned": 0}
+        return fixed
+    if not isinstance(ports, dict):
+        return fixed
+    for k, v in ports.items():
+        if not str(k).isdigit():
+            continue
+        p = int(k)
+        if not (1 <= p <= 65535):
+            continue
+        if isinstance(v, dict):
+            fixed[str(p)] = {
+                "count": max(1, int(v.get("count", 1) or 1)),
+                "first_seen": int(v.get("first_seen", 0) or 0),
+                "last_seen": int(v.get("last_seen", 0) or 0),
+                "last_scanned": int(v.get("last_scanned", 0) or 0),
+            }
+        else:
+            fixed[str(p)] = {"count": 1, "first_seen": 0,
+                             "last_seen": 0, "last_scanned": 0}
+    return fixed
 
-    elif isinstance(ports, dict):
-        fixed = {}
-        for k, v in ports.items():
-            if not str(k).isdigit():
-                continue
-            p = int(k)
-            if not (1 <= p <= 65535):
-                continue
-            if isinstance(v, dict):
-                fixed[str(p)] = {
-                    "count": max(1, int(v.get("count", 1) or 1)),
-                    "first_seen": int(v.get("first_seen", 0) or 0),
-                    "last_seen": int(v.get("last_seen", 0) or 0),
-                    "last_scanned": int(v.get("last_scanned", 0) or 0),
-                }
-            else:
-                fixed[str(p)] = {"count": 1, "first_seen": 0,
-                                 "last_seen": 0, "last_scanned": 0}
-        data["ports"] = fixed
-    else:
-        data["ports"] = {}
 
+def _fix_bucket(raw, label_fallback=""):
+    if not isinstance(raw, dict):
+        return blank_asn(label_fallback)
+    b = blank_asn(str(raw.get("label", label_fallback) or label_fallback))
+    b["ports"] = _fix_ports(raw.get("ports"))
+    b["pending_selected"] = [int(x) for x in (raw.get("pending_selected") or [])
+                             if str(x).isdigit()]
+    b["last_scan_ts"] = int(raw.get("last_scan_ts", 0) or 0)
+    try:
+        b["throughput_ema"] = float(raw.get("throughput_ema", 0) or 0)
+    except (TypeError, ValueError):
+        b["throughput_ema"] = 0
+    b["ip_count_seen"] = int(raw.get("ip_count_seen", 0) or 0)
+    return b
+
+
+def _migrate(data):
+    """v1（ports 是 list）/ v2（ports 是 dict）→ v3（按 ASN 分组）"""
+    if "asns" not in data:
+        # 旧档案只采集过 AS906，整体归到 906 桶
+        bucket = _fix_bucket({
+            "label": "DMIT",
+            "ports": data.get("ports"),
+            "pending_selected": data.get("pending_selected"),
+            "last_scan_ts": data.get("last_scan_ts"),
+            "throughput_ema": data.get("throughput_ema"),
+            "ip_count_seen": data.get("ip_count_seen"),
+        }, "DMIT")
+        out = {
+            "version": STATE_VERSION,
+            "last_msg_id": int(data.get("last_msg_id", 0) or 0),
+            "asns": {"906": bucket},
+        }
+        print(f"[migrate] -> v3: 旧档案 {len(bucket['ports'])} 个端口归入 AS906",
+              flush=True)
+        return out
+
+    asns = data.get("asns")
+    fixed = {}
+    if isinstance(asns, dict):
+        for k, v in asns.items():
+            key = str(k).strip().upper().replace("AS", "") if str(k).strip() else ""
+            if not key:
+                continue
+            fixed[key] = _fix_bucket(v)
+    data["asns"] = fixed
     data["version"] = STATE_VERSION
     data["last_msg_id"] = int(data.get("last_msg_id", 0) or 0)
+    # 清掉 v2 残留的顶层字段（已并入 906 桶）
+    for k in ("ports", "pending_selected", "last_scan_ts",
+              "throughput_ema", "ip_count_seen"):
+        data.pop(k, None)
     return data
+
+
+def get_bucket(state, asn_key, label=""):
+    """取（不存在则建）某 ASN 的桶。asn_key 会被规整成纯数字或大写名。"""
+    key = str(asn_key).strip().upper()
+    if key.startswith("AS"):
+        key = key[2:]
+    if not key:
+        raise ValueError("asn_key 不能为空")
+    b = state["asns"].get(key)
+    if b is None:
+        b = blank_asn(label)
+        state["asns"][key] = b
+    elif label and not b.get("label"):
+        b["label"] = label
+    return b
 
 
 def load_state(path):
