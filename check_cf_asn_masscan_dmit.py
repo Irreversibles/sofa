@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DMIT(AS906) 专用：masscan 探活 + asyncio 三阶段 TLS + API 确认。
+masscan 探活 + asyncio 三阶段 TLS + API 确认。
 
 以手动腾讯脚本 check_cf_asn_masscan.py 的探活逻辑为蓝本（保证与已验证
 的实现一致），额外加了自动流程需要的三样，全部由环境变量控制：
@@ -9,6 +9,12 @@ DMIT(AS906) 专用：masscan 探活 + asyncio 三阶段 TLS + API 确认。
   - metrics 输出：masscan 实测吞吐，供 build_dmit_ports.py EMA 自校准配额
   - 覆盖跟踪：整轮成功=选中端口全标记已扫；截断=不标记，下轮重扫（不漏）
 不设 SCAN_DEADLINE_MIN 时闸门关闭，可当普通 masscan 脚本用。
+
+目标/名字/端口全由 argv 传入，实现是通用的（文件名带 dmit 只是历史原因），
+DMIT 和 xTom 等多条线共用本脚本。第一个参数支持逗号分隔多 ASN 或 CIDR。
+
+日志不输出任何 IP：本仓库公开，Actions 日志虽不进代码搜索索引但登录可见。
+结果只写入文件、推送私库。
 """
 import asyncio
 import ssl
@@ -223,6 +229,8 @@ def run_masscan(ports, deadline_ts=None):
 
     pattern = re.compile(r'([\d.]+)%\s+done.*?found=(\d+)')
     rate_pattern = re.compile(r'rate:\s*([\d.]+)-?k?pps', re.IGNORECASE)
+    # masscan 的错误行可能带目标 IP，日志里只保留类型不回显原文
+    ip_like = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b')
     state = {"last_ms": -1, "last_pct": 0.0}
 
     try:
@@ -246,7 +254,8 @@ def run_masscan(ports, deadline_ts=None):
                     rate_str = f" | 实际速率≈{rm.group(1)}kpps" if rm else ""
                     print(f"  [masscan] {ms}% | 开放: {found}{rate_str}", flush=True)
             elif "FAIL" in line or "error" in line.lower():
-                print(f"  [masscan] {line.rstrip()}", flush=True)
+                safe = ip_like.sub("<ip>", line.rstrip())
+                print(f"  [masscan] {safe}", flush=True)
 
     t = threading.Thread(target=reader, daemon=True)
     t.start()
@@ -466,6 +475,32 @@ def load_old_lines(path):
     return lines
 
 
+def filter_blackhole(open_ports, port_total):
+    """剔除单 IP 开放端口数异常多的目标 —— 那是防护设备的假开放，
+    不是真服务。日志只给统计分布，不输出 IP。"""
+    if port_total <= BLACKHOLE_MIN_PORTS:
+        print(f"[*] 端口数 {port_total} ≤ {BLACKHOLE_MIN_PORTS}，"
+              f"跳过黑洞IP过滤", flush=True)
+        return open_ports
+
+    threshold = max(BLACKHOLE_MIN, int(port_total * BLACKHOLE_RATIO))
+    ip_cnt = Counter(ip for ip, _ in open_ports)
+    bad = {ip: c for ip, c in ip_cnt.items() if c >= threshold}
+    if not bad:
+        print(f"[*] 黑洞IP过滤：无 IP 达到阈值（单IP开放 ≥ {threshold}）", flush=True)
+        return open_ports
+
+    before = len(open_ports)
+    kept = [(ip, p) for ip, p in open_ports if ip not in bad]
+    counts = sorted(bad.values(), reverse=True)
+    mid = counts[len(counts) // 2]
+    print(f"[*] 剔除疑似黑洞 IP {len(bad)} 个（单IP开放 ≥ {threshold}），"
+          f"开放数 {before:,} → {len(kept):,}", flush=True)
+    print(f"    开放端口数分布: 最高 {counts[0]} / 中位 {mid} / 最低 {counts[-1]}"
+          f"（共剔除 {before - len(kept):,} 条候选）", flush=True)
+    return kept
+
+
 async def main():
     target_input = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET
     name_arg = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
@@ -577,23 +612,7 @@ async def main():
           f"（TLS 阶段工作量降至 {len(open_ports)/max(total_scans,1)*100:.2f}%）",
           flush=True)
 
-    # 黑洞 IP 过滤
-    if len(target_ports) > BLACKHOLE_MIN_PORTS:
-        threshold = max(BLACKHOLE_MIN, int(len(target_ports) * BLACKHOLE_RATIO))
-        ip_cnt = Counter(ip for ip, _ in open_ports)
-        bad_ips = {ip for ip, c in ip_cnt.items() if c >= threshold}
-        if bad_ips:
-            before = len(open_ports)
-            open_ports = [(ip, p) for ip, p in open_ports if ip not in bad_ips]
-            print(f"[*] 剔除疑似黑洞 IP {len(bad_ips)} 个（单IP开放 ≥ {threshold}），"
-                  f"开放数 {before:,} → {len(open_ports):,}", flush=True)
-            for ip in sorted(bad_ips, key=lambda x: -ip_cnt[x])[:10]:
-                print(f"    x {ip} (开放 {ip_cnt[ip]} 个)", flush=True)
-            if len(bad_ips) > 10:
-                print(f"    ... 另有 {len(bad_ips) - 10} 个", flush=True)
-    else:
-        print(f"[*] 端口数 {len(target_ports)} ≤ {BLACKHOLE_MIN_PORTS}，"
-              f"跳过黑洞IP过滤", flush=True)
+    open_ports = filter_blackhole(open_ports, len(target_ports))
 
     random.shuffle(open_ports)
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
