@@ -1,9 +1,13 @@
-name: Scan xTom (AS3258)
+name: Scan xTom (AS3258+6233+3214+8888+9312+4785)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 2'   # 每周二 UTC 03:00
+    # 每天 UTC 20:00 触发，是否执行由 build 的 SHOULD_RUN 决定。
+    # 20:00 是空档：Alibaba 01/13、DMIT 02:20、Google 04/16、
+    # Tencent 周一四 10:00、Recheck 06:00。避开 DMIT 是必须的 ——
+    # 两条线共写 dmit_ports_state.json，重叠会造成 JSON 冲突。
+    - cron: '0 20 * * *'
 
 concurrency:
   group: scan-xtom
@@ -14,7 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
-      contents: write
+      contents: read
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -28,92 +33,181 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y masscan
 
-      - name: Pull old results
+      - name: Pull old result + port state
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
-          # 只拷自己的结果文件，避免 push 时把别人的旧副本推回去
-          cp result_repo/xTom-jp.txt ./ 2>/dev/null || true
+          cp result_repo/xTom.txt ./ 2>/dev/null || true
+          cp result_repo/dmit_ports_state.json ./ 2>/dev/null || true
 
+      # 不做 collect：端口档案由 DMIT 线的 collect 步骤统一更新（它会写入
+      # 所有见到的 ASN 桶，包括 xTom 这六个）。这里只读档案、选端口。
+      #
+      # 六个 ASN 都是 xTom，共用一条线：build 合并六桶端口池，
+      # 扫描器合并六者 IP 段。主桶 3258 存轮转进度和吞吐 EMA。
+      # 落地国家由 API 返回写进 #country，所以标签不带地区 —— 这六个
+      # ASN 分布在日本/德国/澳洲/新加坡等地，写 "jp" 会自相矛盾。
+      - name: Build port list + cadence decision
+        env:
+          STATE_FILE: "dmit_ports_state.json"
+          ASN: "3258,6233,3214,8888,9312,4785"
+          DEFAULT_PORTS: "443,8443,2053,2083,2096"
+          SCAN_BUDGET_MIN: "170"
+          # 2000pps 对应的吞吐初值（DMIT 实测 5000pps ≈ 87,000/分钟）
+          TCP_THROUGHPUT: "35000"
+          THROUGHPUT_SAFETY: "0.85"
+          EMA_ALPHA: "0.5"
+          PORTS_MIN_TOTAL: "10"
+          PORTS_MAX_TOTAL: "40"
+          CADENCE_CYCLE1_DAYS: "3"
+          CADENCE_CYCLE2_DAYS: "2"
+          CADENCE_CYCLE4_DAYS: "1"
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python build_dmit_ports.py
+
+      # 复用 DMIT 那个 masscan 脚本（名字带 dmit 但实现通用：
+      # 目标/名字/端口全由 argv 传入）。rate 降到 2000 —— xTom 是小
+      # 服务商，5000pps 打完几万 IP 只要几分钟，流量特征太显眼。
       - name: Run Scan
+        id: scan
+        if: env.SHOULD_RUN == 'true'
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
           CHECK_API: ${{ secrets.CHECK_API }}
+          MASK_PORT_LOG: "1"
+          SCAN_DEADLINE_MIN: "300"
+          MASSCAN_RATE: "2000"
+          MASSCAN_RETRIES: "2"
+          MASSCAN_WAIT: "5"
         run: |
-          python check_cf_asn.py "3258" "xTom-jp" "443,8443,2053,2083,2096"
+          echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
+          python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "xTom" "${MERGED_PORTS}"
 
-      - name: Push result to private repo
+      # ASN 必须和 build 完全一致，否则副桶的 last_scanned 标记不上
+      - name: Finalize port rotation
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
-          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+          STATE_FILE: "dmit_ports_state.json"
+          ASN: "3258,6233,3214,8888,9312,4785"
+        run: python build_dmit_ports.py --finalize
+
+      - name: Push port state (always)
+        if: always()
         run: |
-          if [ ! -s xTom-jp.txt ]; then
-            echo "xTom-jp.txt 不存在或为空，本次无结果，跳过推送"
+          test -d result_repo || exit 0
+          test -f dmit_ports_state.json || exit 0
+
+          cp dmit_ports_state.json result_repo/
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add dmit_ports_state.json
+
+          if git diff --staged --quiet; then
+            echo "no state change"
             exit 0
           fi
-          cp xTom-jp.txt result_repo/
+
+          git commit -m "auto: update xTom port rotation state"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "state push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.json) git checkout --theirs "$f" || true ;;
+                    *)      sort -u "$f" -o "$f" ;;
+                  esac
+                  git add "$f"
+                done
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Push result to private repo
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
+        run: |
+          if [ ! -s xTom.txt ]; then
+            echo "xTom.txt 不存在或为空，本次无结果，跳过推送"
+            exit 0
+          fi
+          cp xTom.txt result_repo/
 
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add xTom-jp.txt
+          git add xTom.txt
           if git diff --staged --quiet; then
             echo "no change"
-          else
-            git commit -m "auto: update xTom-jp"
-            for i in 1 2 3 4 5; do
-              git push && break
-              echo "push 冲突，第 $i 次重试..."
-              if ! git pull --rebase origin main; then
-                # rebase 冲突处理：
-                #   .txt 结果文件是行集合、顺序无关，sort -u 取并集是安全的
-                #   （冲突通常来自 recheck 同时在刷 country / 剔除失效条目）
-                #   其他类型文件排序会破坏结构 → 放弃本次 rebase
-                CONFLICTS=$(git diff --name-only --diff-filter=U)
-                ABORT=0
-                if [ -n "$CONFLICTS" ]; then
-                  for f in $CONFLICTS; do
-                    case "$f" in
-                      *.txt)
-                        echo "  合并冲突文件: $f"
-                        sort -u "$f" -o "$f"
-                        git add "$f"
-                        ;;
-                      *)
-                        echo "  非文本文件冲突，放弃本次 rebase: $f"
-                        ABORT=1
-                        break
-                        ;;
-                    esac
-                  done
-                fi
-                if [ "$ABORT" = "1" ]; then
-                  git rebase --abort 2>/dev/null || true
-                elif [ -n "$CONFLICTS" ]; then
-                  GIT_EDITOR=true git rebase --continue || git rebase --abort
-                else
-                  git rebase --abort 2>/dev/null || true
-                fi
-              fi
-              sleep $((RANDOM % 10 + 5))
-            done
+            exit 0
           fi
+
+          git commit -m "auto: update xTom"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              # .txt 结果文件是行集合、顺序无关，sort -u 取并集安全
+              #（冲突通常来自 recheck 同时在刷 country / 剔除失效条目）
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              ABORT=0
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.txt)  sort -u "$f" -o "$f"; git add "$f" ;;
+                    *.json) git checkout --theirs "$f" || true; git add "$f" ;;
+                    *)      ABORT=1; break ;;
+                  esac
+                done
+              fi
+              if [ "$ABORT" = "1" ]; then
+                git rebase --abort 2>/dev/null || true
+              elif [ -n "$CONFLICTS" ]; then
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Cleanup local sensitive files
+        if: always()
+        run: |
+          rm -f dmit_ports_state.json dmit_ports_pool.txt
+          rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -rf .tmp
 
       - name: Notify TG
         if: always()
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
-          if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: xTom-jp%0A目标: AS3258%0A本次新增: ${COUNT} 个"
+          TRUNC=$(cat scan_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全，剩余下轮优先补"
+
+          if [ "${{ job.status }}" != "success" ]; then
+            MSG="❌ 扫描失败%0A服务商: xTom (6 个 ASN)%0A状态: ${{ job.status }}"
+          elif [ "${SHOULD_RUN:-false}" != "true" ]; then
+            MSG="⏭️ 本次跳过%0A服务商: xTom (6 个 ASN)%0A端口档案: ${POOL_COUNT:-?}%0A阶段: ${SWEEP_PHASE:-?}（待覆盖 ${REMAINING_UNSCANNED:-?}）%0A间隔 ${CADENCE_DAYS:-?} 天"
           else
-            MSG="❌ 扫描失败%0A服务商: xTom-jp%0A目标: AS3258%0A状态: ${{ job.status }}"
+            MSG="✅ 扫描完成%0A服务商: xTom (6 个 ASN)%0A端口: ${MERGED_PORTS_COUNT:-?}（默认5 + 新扫 ${NEW_COUNT:-?} + 复扫 ${RESCAN_COUNT:-?}）%0A阶段: ${SWEEP_PHASE:-?}（池 ${POOL_COUNT:-?}，待覆盖 ${REMAINING_UNSCANNED:-?}）%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天%0A本次新增: ${COUNT} 个${WARN}"
           fi
-          echo "发送内容: ${MSG}"
+
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT_ID }} \
             -d text="${MSG}")
-          echo "$RESP"
+
           case "$RESP" in
             *'"ok":true'*) : ;;
             *) echo "::error::TG 推送失败" ;;
