@@ -1,0 +1,243 @@
+name: Scan LongTail (14 high-frequency small ASNs)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 UTC 12:00 触发，是否执行由 build 的 SHOULD_RUN 决定。
+    # 必须避开 DMIT(02:20) 和 xTom(20:00) —— 只有这三条线写
+    # dmit_ports_state.json，重叠会造成 JSON 冲突、rebase 解不了。
+    # 与 Alibaba(13:00) 只是 push 竞争，不同文件，重试逻辑能处理。
+    - cron: '0 12 * * *'
+
+concurrency:
+  group: scan-longtail
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y masscan
+
+      - name: Pull old results + port state
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          cp result_repo/dmit_ports_state.json ./ 2>/dev/null || true
+          # 通配拉全部结果文件，不写死名单：本线按服务商分文件输出，
+          # 一旦某个产出文件没拉下来，write_result_file 读到空集、
+          # old_count=0 导致防覆盖保护不触发，会用只含本轮结果的版本
+          # 覆盖掉私库里的历史累积。推送时仍只推 scan_out_files.txt 里列的。
+          shopt -s nullglob
+          for f in result_repo/*.txt; do
+            case "$(basename "$f")" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+            esac
+            cp "$f" ./ 2>/dev/null || true
+          done
+
+      # 不做 collect：端口档案由 DMIT 线统一更新（它不按 ASN 过滤，
+      # 消息里出现的每个 ASN 都写进对应桶）。这里只读档案、选端口。
+      #
+      # 14 个 ASN 是长尾里消息条数 ≥6 的（bot 发得越勤 = 那个 ASN 上
+      # 越确实有人在用 CF 反代）。合计约 45.7 万 IP，是 xTom 的 4 倍。
+      # build 合并 14 桶端口池，扫描器合并 14 者 IP 段。主桶 61112
+      # （AkileCloud，77 条消息、57 端口）存轮转进度和吞吐 EMA。
+      - name: Build port list + cadence decision
+        env:
+          STATE_FILE: "dmit_ports_state.json"
+          ASN: "61112,212336,139659,63473,149440,6134,932,967,400464,63150,1054,38136,26383,138997"
+          DEFAULT_PORTS: "443,8443,2053,2083,2096"
+          SCAN_BUDGET_MIN: "170"
+          # 3000pps 的吞吐初值：5000pps 实测 87,604、2000pps 实测 35,673，线性插值
+          TCP_THROUGHPUT: "53000"
+          THROUGHPUT_SAFETY: "0.85"
+          EMA_ALPHA: "0.5"
+          PORTS_MIN_TOTAL: "10"
+          PORTS_MAX_TOTAL: "30"
+          CADENCE_CYCLE1_DAYS: "3"
+          CADENCE_CYCLE2_DAYS: "2"
+          CADENCE_CYCLE4_DAYS: "1"
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python build_dmit_ports.py
+
+      # ASN_NAMES 触发分文件输出：这条线里是 12 家不同服务商，不能像
+      # DMIT/xTom 那样共用一个标签。同一服务商的多个 ASN 映射到同一名字，
+      # 结果会合并进一个文件（AS967+AS400464=VMISS，AS6134+AS932=XNNET）。
+      # 未列出的 ASN 兜底用 AS{num}.txt。argv[2] 此模式下只写 name.txt。
+      - name: Run Scan
+        id: scan
+        if: env.SHOULD_RUN == 'true'
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          CHECK_API: ${{ secrets.CHECK_API }}
+          MASK_PORT_LOG: "1"
+          SCAN_DEADLINE_MIN: "300"
+          MASSCAN_RATE: "3000"
+          MASSCAN_RETRIES: "2"
+          MASSCAN_WAIT: "5"
+          ASN_NAMES: >-
+            61112=AkileCloud,212336=ByteVirt,139659=LUCIDACLOUD,
+            63473=HostHatch,149440=Evoxt,6134=XNNET,932=XNNET,
+            967=VMISS,400464=VMISS,63150=BAGECLOUD,1054=Zont,
+            38136=Akari,26383=Baxet,138997=EonsData
+        run: |
+          echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
+          python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "LongTail" "${MERGED_PORTS}"
+
+      # ASN 必须和 build 完全一致，否则副桶的 last_scanned 标记不上
+      - name: Finalize port rotation
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
+        env:
+          STATE_FILE: "dmit_ports_state.json"
+          ASN: "61112,212336,139659,63473,149440,6134,932,967,400464,63150,1054,38136,26383,138997"
+        run: python build_dmit_ports.py --finalize
+
+      - name: Push port state (always)
+        if: always()
+        run: |
+          test -d result_repo || exit 0
+          test -f dmit_ports_state.json || exit 0
+
+          cp dmit_ports_state.json result_repo/
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add dmit_ports_state.json
+
+          if git diff --staged --quiet; then
+            echo "no state change"
+            exit 0
+          fi
+
+          git commit -m "auto: update longtail port rotation state"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "state push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.json) git checkout --theirs "$f" || true ;;
+                    *)      sort -u "$f" -o "$f" ;;
+                  esac
+                  git add "$f"
+                done
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      # 产出文件名由脚本写在 scan_out_files.txt 里，逐个 cp/add。
+      # 不用通配符：pull 阶段拉了全部 .txt，通配会把别的线的旧副本
+      # 一起提交，若期间它们推了新结果就会被回滚。
+      - name: Push results
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
+        run: |
+          if [ ! -s scan_out_files.txt ]; then
+            echo "本轮无产出文件，跳过推送"
+            exit 0
+          fi
+
+          while read -r f; do
+            [ -z "$f" ] && continue
+            [ -s "$f" ] || continue
+            cp "$f" result_repo/
+          done < scan_out_files.txt
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          while read -r f; do
+            [ -z "$f" ] && continue
+            git add "$f" 2>/dev/null || true
+          done < ../scan_out_files.txt
+
+          if git diff --staged --quiet; then
+            echo "no change"
+            exit 0
+          fi
+
+          git commit -m "auto: update longtail results"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              # .txt 是行集合、顺序无关，sort -u 取并集安全
+              #（冲突通常来自 recheck 同时在刷 country / 剔除失效条目）
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              ABORT=0
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.txt)  sort -u "$f" -o "$f"; git add "$f" ;;
+                    *.json) git checkout --theirs "$f" || true; git add "$f" ;;
+                    *)      ABORT=1; break ;;
+                  esac
+                done
+              fi
+              if [ "$ABORT" = "1" ]; then
+                git rebase --abort 2>/dev/null || true
+              elif [ -n "$CONFLICTS" ]; then
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Cleanup local sensitive files
+        if: always()
+        run: |
+          rm -f dmit_ports_state.json dmit_ports_pool.txt
+          rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -f scan_out_files.txt
+          rm -rf .tmp
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          TRUNC=$(cat scan_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全，剩余下轮优先补"
+
+          if [ "${{ job.status }}" != "success" ]; then
+            MSG="❌ 扫描失败%0A分组: 长尾精选 (14 个 ASN)%0A状态: ${{ job.status }}"
+          elif [ "${SHOULD_RUN:-false}" != "true" ]; then
+            MSG="⏭️ 本次跳过%0A分组: 长尾精选 (14 个 ASN)%0A端口档案: ${POOL_COUNT:-?}%0A阶段: ${SWEEP_PHASE:-?}（待覆盖 ${REMAINING_UNSCANNED:-?}）%0A间隔 ${CADENCE_DAYS:-?} 天"
+          else
+            MSG="✅ 扫描完成%0A分组: 长尾精选 (14 个 ASN)%0A端口: ${MERGED_PORTS_COUNT:-?}（默认5 + 新扫 ${NEW_COUNT:-?} + 复扫 ${RESCAN_COUNT:-?}）%0A阶段: ${SWEEP_PHASE:-?}（池 ${POOL_COUNT:-?}，待覆盖 ${REMAINING_UNSCANNED:-?}）%0A轮转一圈 ${CYCLE_ROUNDS:-?} 轮 → 间隔 ${CADENCE_DAYS:-?} 天%0A本次新增: ${COUNT} 个${WARN}"
+          fi
+
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}")
+
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
