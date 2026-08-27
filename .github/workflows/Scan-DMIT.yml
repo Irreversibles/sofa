@@ -3,7 +3,15 @@ name: Scan DMIT (AS906+AS32519 masscan + budget-driven + cycle cadence)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '20 2 * * *'   # 每天触发，是否执行由 build 步骤的 SHOULD_RUN 决定
+    # 每天 02:20 UTC 触发，是否执行由 build 的 SHOULD_RUN 决定。
+    #
+    # DMIT / xTom / LongTail 三条线共写 dmit_ports_state.json，JSON 冲突
+    # rebase 解不了（只能 --theirs 丢一方的轮转标记），所以按 8 小时等距
+    # 排开：DMIT 02:20 → LongTail 11:00 → xTom 19:00。间隔 8h40m / 8h /
+    # 7h20m，都大于 timeout-minutes 350（5h50m），跑满上限也不会重叠。
+    # 本线固定第一位：collect 步骤是全系统唯一采集入口，越早跑，当天
+    # 后面两条线拿到的端口档案越新。
+    - cron: '20 2 * * *'
 
 concurrency:
   group: scan-dmit
@@ -43,8 +51,9 @@ jobs:
 
       # 采集无条件执行：即使今天不扫，也要保住新端口和游标。
       # 这一步是全系统唯一的采集入口 —— 它不按 ASN 过滤，消息里出现的
-      # 每个 ASN 都会写进对应桶，所以 xTom 等其他线的端口也靠它更新。
-      # 日志里 "发布消息 N 条" 长期为 0 说明采集断了（session 过期等）。
+      # 每个 ASN 都会写进对应桶，所以 xTom / LongTail 等其他线的端口
+      # 也靠它更新。日志里 "发布消息 N 条" 长期为 0 说明采集断了
+      #（session 过期等），那时所有线的端口档案都会停止增长。
       - name: Collect ports from TG group
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -70,16 +79,19 @@ jobs:
           STATE_FILE: "dmit_ports_state.json"
         run: python collect_csv_ports.py
 
-      # 选端口 + 决策 SHOULD_RUN（手动触发时强制跑）
+      # 选端口 + 决策 SHOULD_RUN（手动触发时强制跑）。
       # ASN 支持逗号分隔多值：906 和 32519 都是 DMIT，共用一条线、
-      # 一份端口池；build 合并两桶的端口，扫描器合并两者的 IP 段
+      # 一份端口池；build 合并两桶的端口，扫描器合并两者的 IP 段。
+      # 这里是本线 ASN 列表的唯一定义处，finalize 继承 SCAN_TARGET。
       - name: Build port list + cadence decision
         env:
           STATE_FILE: "dmit_ports_state.json"
           ASN: "906,32519"
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           SCAN_BUDGET_MIN: "170"
-          TCP_THROUGHPUT: "60000"
+          # 5000pps 实测吞吐（本线：4,474,880 目标 / 51.1 分钟）。
+          # 仅在 state 里还没有 EMA 时用作初值。
+          TCP_THROUGHPUT: "87604"
           THROUGHPUT_SAFETY: "0.85"
           EMA_ALPHA: "0.5"
           PORTS_MIN_TOTAL: "10"
@@ -106,20 +118,20 @@ jobs:
           echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
           python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "DMIT" "${MERGED_PORTS}"
 
-      # 只有真正扫成功才推进轮转（读 scan_done_ports.txt）+ EMA 校准吞吐
-      # ASN 必须和 build 一致，否则 32519 桶的 last_scanned 标记不上
+      # 只有真正扫成功才推进轮转（读 scan_done_ports.txt）+ EMA 校准吞吐。
+      # ASN 继承 build 写出的 SCAN_TARGET，不重复维护第二份列表 —— 两处
+      # 一旦不一致，缺失桶的 last_scanned 标不上，那些端口会被无限重选、
+      # 轮转永不推进，且日志看不出异常。
       - name: Finalize port rotation
         if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
           STATE_FILE: "dmit_ports_state.json"
-          ASN: "906,32519"
+          ASN: ${{ env.SCAN_TARGET }}
         run: python build_dmit_ports.py --finalize
 
       # state 无条件推送：跳过扫描也要保住采集成果和轮转进度
       - name: Push port state (always)
         if: always()
-        env:
-          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           test -d result_repo || exit 0
           test -f dmit_ports_state.json || exit 0
@@ -161,8 +173,6 @@ jobs:
 
       - name: Push DMIT result
         if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
-        env:
-          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           if [ ! -s DMIT.txt ]; then
             echo "DMIT.txt 不存在或为空，跳过推送"
@@ -186,6 +196,8 @@ jobs:
             git push && break
             echo "push 冲突，第 $i 次重试..."
             if ! git pull --rebase origin main; then
+              # .txt 结果文件是行集合、顺序无关，sort -u 取并集安全
+              #（冲突通常来自 recheck 同时在刷 country / 剔除失效条目）
               CONFLICTS=$(git diff --name-only --diff-filter=U)
               ABORT=0
               if [ -n "$CONFLICTS" ]; then
@@ -213,6 +225,7 @@ jobs:
         run: |
           rm -f dmit_ports_pool.txt dmit_ports_state.json
           rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -f scan_out_files.txt
           rm -f tg_dmit_ports.session
           rm -rf .tmp
 
