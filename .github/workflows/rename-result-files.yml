@@ -1,0 +1,148 @@
+name: Rename result files (one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      renames:
+        description: '旧名=新名，逗号分隔。如 NEBULA-=Nebula,AkileCloud=Akile'
+        required: true
+      confirm:
+        description: '填 yes 才真正写入并删除旧文件；留空只做预演'
+        required: false
+        default: ''
+
+concurrency:
+  group: rename-result-files
+  cancel-in-progress: false
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone private results
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone \
+            "https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git" result_repo
+
+      # 迁移 = 改文件名 + 改每行行尾的标签 + 与目标文件合并去重。
+      # 只改标签不改文件名会留下两种标签；只改文件名不改标签同理。
+      # 默认预演，confirm=yes 才落盘。
+      - name: Migrate
+        env:
+          RENAMES: ${{ inputs.renames }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          python - <<'PY'
+          import ipaddress, os, re, sys
+
+          CONFIRM = os.environ.get("CONFIRM", "").strip().lower() == "yes"
+          pairs = []
+          for item in re.split(r"[,\n]+", os.environ.get("RENAMES", "")):
+              item = item.strip()
+              if not item or "=" not in item:
+                  continue
+              old, new = (x.strip() for x in item.split("=", 1))
+              if old and new and old != new:
+                  pairs.append((old, new))
+          if not pairs:
+              print("::error::renames 没有有效的 旧名=新名 对")
+              sys.exit(1)
+
+          def read(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return [l.strip() for l in f if l.strip()]
+              except FileNotFoundError:
+                  return None
+
+          def relabel(line, label):
+              """ip:port#country OLD → ip:port#country NEW（标签可含空格）"""
+              if "#" not in line:
+                  return None
+              addr, rest = line.split("#", 1)
+              parts = rest.split(None, 1)
+              country = parts[0] if parts else "??"
+              return f"{addr}#{country} {label}"
+
+          def sort_key(line):
+              try:
+                  addr = line.split("#")[0]
+                  ip_part, port_part = addr.rsplit(":", 1)
+                  country = line.split("#")[1].split()[0]
+                  return (country, ipaddress.ip_address(ip_part), int(port_part))
+              except Exception:
+                  return ("??", ipaddress.ip_address("0.0.0.0"), 0)
+
+          plan = []
+          for old, new in pairs:
+              src = f"result_repo/{old}.txt"
+              dst = f"result_repo/{new}.txt"
+              src_lines = read(src)
+              if src_lines is None:
+                  print(f"[skip] {old}.txt 不存在")
+                  continue
+              dst_lines = read(dst)
+              merged = set(dst_lines or [])
+              before = len(merged)
+              bad = 0
+              for l in src_lines:
+                  r = relabel(l, new)
+                  if r is None:
+                      bad += 1
+                      continue
+                  merged.add(r)
+              added = len(merged) - before
+              print(f"[plan] {old}.txt({len(src_lines)}) → {new}.txt"
+                    f"（原有 {before} + 新增 {added} = {len(merged)}）"
+                    f"{f' | 解析失败 {bad}' if bad else ''}")
+              plan.append((src, dst, sorted(merged, key=sort_key)))
+
+          if not plan:
+              print("无可迁移的文件")
+              sys.exit(0)
+          if not CONFIRM:
+              print("\n预演结束，未写入。确认无误后把 confirm 填 yes 重跑。")
+              sys.exit(0)
+
+          for src, dst, lines in plan:
+              with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                  for l in lines:
+                      f.write(l + "\n")
+              os.remove(src)
+              print(f"[done] 写入 {dst}（{len(lines)} 条），删除 {src}")
+          with open("changed", "w") as f:
+              f.write("1")
+          PY
+
+      - name: Push
+        run: |
+          test -f changed || { echo "预演模式，不推送"; exit 0; }
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "no change"
+            exit 0
+          fi
+          git commit -m "chore: rename result files"
+          for i in 1 2 3; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf result_repo
