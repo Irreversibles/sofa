@@ -3,11 +3,13 @@ name: Scan xTom (AS3258+6233+3214+8888+9312+4785)
 on:
   workflow_dispatch:
   schedule:
-    # 每天 UTC 20:00 触发，是否执行由 build 的 SHOULD_RUN 决定。
-    # 20:00 是空档：Alibaba 01/13、DMIT 02:20、Google 04/16、
-    # Tencent 周一四 10:00、Recheck 06:00。避开 DMIT 是必须的 ——
-    # 两条线共写 dmit_ports_state.json，重叠会造成 JSON 冲突。
-    - cron: '0 20 * * *'
+    # 每天 19:00 UTC 触发，是否执行由 build 的 SHOULD_RUN 决定。
+    #
+    # DMIT / xTom / LongTail 三条线共写 dmit_ports_state.json，按 8 小时
+    # 等距排开：DMIT 02:20 → LongTail 11:00 → xTom 19:00。本线最坏跑到
+    # 次日 00:50（350 分钟上限），距 Alibaba 01:00 和 DMIT 02:20 都有余量。
+    # 原先 20:00 起、最坏到 01:50，离 DMIT 只剩 30 分钟，太紧。
+    - cron: '0 19 * * *'
 
 concurrency:
   group: scan-xtom
@@ -51,14 +53,17 @@ jobs:
       # 扫描器合并六者 IP 段。主桶 3258 存轮转进度和吞吐 EMA。
       # 落地国家由 API 返回写进 #country，所以标签不带地区 —— 这六个
       # ASN 分布在日本/德国/澳洲/新加坡等地，写 "jp" 会自相矛盾。
+      #
+      # 这里是本线 ASN 列表的唯一定义处，finalize 继承 SCAN_TARGET。
       - name: Build port list + cadence decision
         env:
           STATE_FILE: "dmit_ports_state.json"
           ASN: "3258,6233,3214,8888,9312,4785"
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           SCAN_BUDGET_MIN: "170"
-          # 2000pps 对应的吞吐初值（DMIT 实测 5000pps ≈ 87,000/分钟）
-          TCP_THROUGHPUT: "35000"
+          # 2000pps 实测吞吐（本线：4,474,880 目标 / 125.4 分钟 = 35,673）。
+          # 仅在 state 里还没有 EMA 时用作初值。
+          TCP_THROUGHPUT: "35673"
           THROUGHPUT_SAFETY: "0.85"
           EMA_ALPHA: "0.5"
           PORTS_MIN_TOTAL: "10"
@@ -70,8 +75,8 @@ jobs:
         run: python build_dmit_ports.py
 
       # 复用 DMIT 那个 masscan 脚本（名字带 dmit 但实现通用：
-      # 目标/名字/端口全由 argv 传入）。rate 降到 2000 —— xTom 是小
-      # 服务商，5000pps 打完几万 IP 只要几分钟，流量特征太显眼。
+      # 目标/名字/端口全由 argv 传入）。rate 2000 —— 这六个 ASN 全属
+      # 一家，11 万 IP 的流量全落在 xTom 身上，不像长尾线那样分摊。
       - name: Run Scan
         id: scan
         if: env.SHOULD_RUN == 'true'
@@ -87,12 +92,14 @@ jobs:
           echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
           python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "xTom" "${MERGED_PORTS}"
 
-      # ASN 必须和 build 完全一致，否则副桶的 last_scanned 标记不上
+      # ASN 继承 build 写出的 SCAN_TARGET，不重复维护第二份列表 ——
+      # 两处一旦不一致，缺失桶的 last_scanned 标不上，那些端口会被无限
+      # 重选、轮转永不推进，且日志看不出异常。
       - name: Finalize port rotation
         if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
           STATE_FILE: "dmit_ports_state.json"
-          ASN: "3258,6233,3214,8888,9312,4785"
+          ASN: ${{ env.SCAN_TARGET }}
         run: python build_dmit_ports.py --finalize
 
       - name: Push port state (always)
@@ -186,6 +193,7 @@ jobs:
         run: |
           rm -f dmit_ports_state.json dmit_ports_pool.txt
           rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -f scan_out_files.txt
           rm -rf .tmp
 
       - name: Notify TG
