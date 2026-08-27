@@ -16,8 +16,15 @@
 截断：被闸门截断而没扫全的端口不标记已扫，下轮自动优先补。
 
 模式：
-    默认        选端口 + 决策 SHOULD_RUN，写进 GITHUB_ENV
+    默认        选端口 + 决策 SHOULD_RUN，写进 GITHUB_ENV（含 SCAN_TARGET）
     --finalize  扫描后调用，标记真正扫完的端口 + EMA 更新吞吐 + 记录时刻
+                ASN 应由 workflow 继承 build 写出的 SCAN_TARGET，不要另写
+                一份列表 —— 两处不一致时，缺失桶的 last_scanned 永远标不上，
+                那些端口每轮被重选、轮转不推进，且日志看不出异常。
+
+注意：本脚本和扫描器各自独立拉一遍 ASN 前缀（这里为算配额、那边为生成
+    masscan 目标）。两者可能拿到不同结果 —— 如果这里少拿到几个 ASN 却
+    照旧分配端口，实际扫描量就会超预算。所以下面对拉取失败做了护栏。
 """
 import ipaddress
 import json
@@ -25,16 +32,28 @@ import math
 import os
 import re
 import sys
+import time
 import urllib.request
 
 from port_state import load_state, save_state, now_ts, get_bucket
 
 STATE_FILE = os.environ.get("STATE_FILE", "dmit_ports_state.json")
 
-_raw_asn = os.environ.get("ASN", "906")
+# ASN 不做静默兜底：DMIT / xTom / 长尾三条线共用本脚本，若 ASN 传空
+# （变量名写错、YAML 缩进错、SCAN_TARGET 未继承到）而这里默认回 906，
+# 本该扫长尾的那轮会变成扫 DMIT，还会去标记 DMIT 桶的 last_scanned、
+# 污染那条线的轮转进度。宁可整轮失败（可见）也不猜（静默错）。
+_raw_asn = os.environ.get("ASN", "").strip()
 ASN_LIST = [x.upper().replace("AS", "").strip()
-            for x in re.split(r"[\s,]+", _raw_asn.strip()) if x.strip()]
-ASN_LIST = [x for x in ASN_LIST if x.isdigit()] or ["906"]
+            for x in re.split(r"[\s,]+", _raw_asn) if x.strip()]
+ASN_LIST = [x for x in ASN_LIST if x.isdigit()]
+if not ASN_LIST:
+    print(f"[-] ASN 未设置或无有效值（收到: {_raw_asn!r}）。拒绝猜测目标，退出。",
+          flush=True)
+    sys.exit(1)
+# 去重但保序：主桶必须稳定是第一个，否则轮转进度会换地方存
+_seen = set()
+ASN_LIST = [a for a in ASN_LIST if not (a in _seen or _seen.add(a))]
 PRIMARY_ASN = ASN_LIST[0]
 
 DEFAULT_PORTS = os.environ.get("DEFAULT_PORTS", "443,8443,2053,2083,2096")
@@ -45,6 +64,11 @@ THROUGHPUT_SAFETY = float(os.environ.get("THROUGHPUT_SAFETY", "0.85"))
 EMA_ALPHA = float(os.environ.get("EMA_ALPHA", "0.5"))
 PORTS_MIN_TOTAL = int(os.environ.get("PORTS_MIN_TOTAL", "10"))
 PORTS_MAX_TOTAL = int(os.environ.get("PORTS_MAX_TOTAL", "80"))
+
+# 前缀拉取失败占比超过此值 → 本次 IP 数不可信，改用历史缓存
+FETCH_FAIL_ABORT_RATIO = float(os.environ.get("FETCH_FAIL_ABORT_RATIO", "0.34"))
+# ASN 较多时给 RIPE stat 留间隔，避免快速连发被限流
+FETCH_GAP_SEC = float(os.environ.get("FETCH_GAP_SEC", "0.5"))
 
 CADENCE_1 = int(os.environ.get("CADENCE_CYCLE1_DAYS", "3"))
 CADENCE_2 = int(os.environ.get("CADENCE_CYCLE2_DAYS", "2"))
@@ -89,9 +113,17 @@ def _prefixes_bgpview(asn):
 
 def count_asn_ips(asn_list):
     """多个 ASN 的前缀合并后 collapse 再计数 —— 同一家的多个 ASN 常有
-    重叠宣告，不合并会重复计数、把配额算大。"""
+    重叠宣告，不合并会重复计数、把配额算大。
+
+    返回 (总 IP 数, 拉取失败的 ASN 数)。失败数交给调用方判断可信度：
+    静默按剩下的 ASN 算会低估 IP 数 → 多分端口 → 实际扫描超预算。
+    """
     nets = []
-    for asn in asn_list:
+    failed = []
+    many = len(asn_list) > 4
+    for i, asn in enumerate(asn_list):
+        if many and i > 0:
+            time.sleep(FETCH_GAP_SEC)
         prefixes = []
         for fn, label in ((_prefixes_ripe, "RIPE"), (_prefixes_bgpview, "bgpview")):
             try:
@@ -104,6 +136,7 @@ def count_asn_ips(asn_list):
                 print(f"[!] AS{asn} {label} 拉取失败: {type(e).__name__}", flush=True)
         if not prefixes:
             print(f"[!] AS{asn} 前缀拉取失败，本次不计入", flush=True)
+            failed.append(asn)
             continue
         for c in prefixes:
             try:
@@ -112,13 +145,18 @@ def count_asn_ips(asn_list):
                     nets.append(n)
             except Exception:
                 continue
+
+    if failed:
+        print(f"[!] 共 {len(failed)}/{len(asn_list)} 个 ASN 拉取失败: "
+              f"AS{',AS'.join(failed)}", flush=True)
+
     if not nets:
-        return 0
+        return 0, len(failed)
     total = 0
     for net in ipaddress.collapse_addresses(nets):
         n = net.num_addresses
         total += n if net.prefixlen >= 31 else max(0, n - 2)
-    return total
+    return total, len(failed)
 
 
 def write_env(pairs):
@@ -188,6 +226,13 @@ def finalize():
                 n += 1
     skipped = len(pend) - len(mark)
 
+    # 跨桶写入为 0 通常意味着 ASN 列表和 build 那次不一致（继承 SCAN_TARGET
+    # 就不会），或 pending 为空（build 没选出端口）。明确报出来，别静默。
+    if mark and n == 0:
+        print(f"[!] 标记了 {len(mark)} 个端口但没有任何桶命中 —— "
+              f"ASN 列表可能与 build 时不一致（当前 AS{','.join(ASN_LIST)}）",
+              flush=True)
+
     m = _read_metrics()
     measured = float(m.get("tcp_throughput_per_min", 0) or 0)
     if measured > 0:
@@ -218,20 +263,33 @@ def main():
     default_set = set(default_ports)
 
     asn_desc = ",".join(ASN_LIST)
-    print(f"[*] 扫描目标 AS{asn_desc}（主桶 AS{PRIMARY_ASN}）", flush=True)
+    print(f"[*] 扫描目标 AS{asn_desc}（{len(ASN_LIST)} 个，主桶 AS{PRIMARY_ASN}）",
+          flush=True)
 
-    fetched = count_asn_ips(ASN_LIST)
+    fetched, failed = count_asn_ips(ASN_LIST)
     prev = int(pb.get("ip_count_seen", 0) or 0)
+    fail_ratio = failed / len(ASN_LIST)
+
     if fetched <= 0:
         ip_count = prev
-        src = "历史缓存（本次拉取失败）"
+        src = "历史缓存（本次全部拉取失败）"
+    elif failed and fail_ratio >= FETCH_FAIL_ABORT_RATIO and prev > 0:
+        # 丢的都是小段时，下面那条"对半砍"护栏挡不住，靠失败占比兜
+        ip_count = prev
+        src = (f"历史缓存（{failed}/{len(ASN_LIST)} 个 ASN 失败，"
+               f"本次 {fetched:,} 不可信）")
     elif prev > 0 and fetched < prev * 0.5:
         ip_count = prev
         src = f"历史缓存（本次仅 {fetched:,}，不足历史 {prev:,} 的一半）"
-    else:
+    elif failed == 0:
         ip_count = fetched
         src = "实时拉取"
         pb["ip_count_seen"] = fetched
+    else:
+        # 部分失败时不写缓存：否则偏低的值被固化成"历史"，下轮的对半砍
+        # 护栏就以它为基准，一路越滑越低
+        ip_count = fetched
+        src = f"实时拉取（{failed} 个 ASN 失败，本次不更新缓存）"
     if ip_count <= 0:
         ip_count = 80000
         src = "兜底估值"
@@ -252,6 +310,9 @@ def main():
           f" = {budget_targets:,.0f} 目标 → 配额 {raw_total} "
           f"（夹到 [{PORTS_MIN_TOTAL},{PORTS_MAX_TOTAL}] → {total_ports}）",
           flush=True)
+    if total_ports > raw_total:
+        print(f"[!] 配额被下限提到 {total_ports}（预算只够 {raw_total}），"
+              f"本轮可能超时，靠扫描器的时间闸门兜", flush=True)
 
     pool = [p for p in pool_map if p not in default_set]
     extra_quota = max(0, total_ports - len(default_ports))
@@ -317,6 +378,7 @@ def main():
 
     write_env({
         "SHOULD_RUN": "true" if should_run else "false",
+        # finalize 继承这个值当 ASN，保证两处列表永远一致
         "SCAN_TARGET": asn_desc,
         "MERGED_PORTS": merged_str,
         "MERGED_PORTS_COUNT": len(merged),
