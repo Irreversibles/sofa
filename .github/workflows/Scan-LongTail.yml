@@ -104,10 +104,10 @@ jobs:
           MASSCAN_RETRIES: "2"
           MASSCAN_WAIT: "5"
           ASN_NAMES: >-
-            61112=AkileCloud,212336=ByteVirt,139659=LUCIDACLOUD,
+            61112=Akile,212336=ByteVirt,139659=LUCIDACLOUD,
             63473=HostHatch,149440=Evoxt,6134=XNNET,932=XNNET,
             967=VMISS,400464=VMISS,63150=BAGECLOUD,1054=Zont,
-            38136=Akari,26383=Baxet,138997=EonsData
+            38136=Akari,26383=Baxet,138997=Eons
         run: |
           echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
           python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "LongTail" "${MERGED_PORTS}"
