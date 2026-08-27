@@ -77,7 +77,7 @@ jobs:
           THROUGHPUT_SAFETY: "0.85"
           EMA_ALPHA: "0.5"
           PORTS_MIN_TOTAL: "10"
-          PORTS_MAX_TOTAL: "30"
+          PORTS_MAX_TOTAL: "8"
           CADENCE_CYCLE1_DAYS: "3"
           CADENCE_CYCLE2_DAYS: "2"
           CADENCE_CYCLE4_DAYS: "1"
