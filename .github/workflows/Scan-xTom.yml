@@ -1,4 +1,4 @@
-name: Scan xTom (AS3258+6233+3214+8888+9312+4785)
+name: Scan xTom
 
 on:
   workflow_dispatch:
