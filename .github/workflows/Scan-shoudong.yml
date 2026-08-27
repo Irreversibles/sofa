@@ -1,0 +1,164 @@
+name: 手动
+
+on:
+  workflow_dispatch:
+    inputs:
+      asn:
+        description: 'ASN，逗号分隔多个（如 136907 或 7488,40065）'
+        required: true
+      name:
+        description: '输出文件名/标签（如 Huawei，可含空格）'
+        required: true
+      ports:
+        description: '端口，逗号分隔。大体量低密度目标建议只用 443,8443'
+        required: false
+        default: '443,8443'
+      rate:
+        description: 'masscan 发包速率 pps。云厂商 5000-10000 安全，小商家建议 2000'
+        required: false
+        default: '5000'
+
+concurrency:
+  group: scan-manual
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y masscan
+
+      - name: Pull old results
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          # 拉全部结果文件：write_result_file 靠本地已有文件触发防覆盖保护，
+          # 目标文件缺失会导致 old_count=0、保护不触发。推送时只推
+          # scan_out_files.txt 里列出的那个，不会误伤别的线。
+          shopt -s nullglob
+          for f in result_repo/*.txt; do
+            case "$(basename "$f")" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+            esac
+            cp "$f" ./ 2>/dev/null || true
+          done
+
+      # 不走 build_dmit_ports.py：本线是一次性扫描，没有端口档案、
+      # 不做轮转、不写任何 state，端口直接由输入指定。所以也没有
+      # cadence 判断，每次触发必跑。
+      - name: Run Scan
+        id: scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          CHECK_API: ${{ secrets.CHECK_API }}
+          MASK_PORT_LOG: "1"
+          SCAN_DEADLINE_MIN: "170"
+          MASSCAN_RATE: ${{ inputs.rate }}
+          MASSCAN_RETRIES: "2"
+          MASSCAN_WAIT: "5"
+        run: |
+          echo "[INFO] asn=${{ inputs.asn }} name=${{ inputs.name }}"
+          python check_cf_asn_masscan_dmit.py \
+            "${{ inputs.asn }}" "${{ inputs.name }}" "${{ inputs.ports }}"
+
+      - name: Push results
+        if: steps.scan.outcome == 'success'
+        run: |
+          if [ ! -s scan_out_files.txt ]; then
+            echo "本轮无产出文件，跳过推送"
+            exit 0
+          fi
+
+          while read -r f; do
+            [ -z "$f" ] && continue
+            [ -s "$f" ] || continue
+            cp "$f" result_repo/
+          done < scan_out_files.txt
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          while read -r f; do
+            [ -z "$f" ] && continue
+            git add "$f" 2>/dev/null || true
+          done < ../scan_out_files.txt
+
+          if git diff --staged --quiet; then
+            echo "no change"
+            exit 0
+          fi
+
+          git commit -m "auto: manual scan results"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              ABORT=0
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.txt)  sort -u "$f" -o "$f"; git add "$f" ;;
+                    *.json) git checkout --theirs "$f" || true; git add "$f" ;;
+                    *)      ABORT=1; break ;;
+                  esac
+                done
+              fi
+              if [ "$ABORT" = "1" ]; then
+                git rebase --abort 2>/dev/null || true
+              elif [ -n "$CONFLICTS" ]; then
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Cleanup local sensitive files
+        if: always()
+        run: |
+          rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -f scan_out_files.txt
+          rm -rf .tmp
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          TRUNC=$(cat scan_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全"
+
+          if [ "${{ job.status }}" != "success" ]; then
+            MSG="❌ 手动扫描失败%0A目标: ${{ inputs.name }} (AS${{ inputs.asn }})%0A状态: ${{ job.status }}"
+          else
+            MSG="✅ 手动扫描完成%0A目标: ${{ inputs.name }} (AS${{ inputs.asn }})%0A本次新增: ${COUNT} 个${WARN}"
+          fi
+
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}")
+
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
