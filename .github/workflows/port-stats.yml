@@ -1,0 +1,101 @@
+name: Port Stats (read-only)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: port-stats
+  cancel-in-progress: true
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone private results
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git" result_repo
+
+      # 只输出聚合占比，不逐个列非默认端口号 —— 各扫描线用 MASK_PORT_LOG
+      # 隐藏了端口列表，这里把"哪些端口有产出"打出来等于反向泄露，
+      # 比端口列表本身更有价值。默认 5 个端口的号码写在公开 yml 的
+      # DEFAULT_PORTS 里，可以点名。
+      - name: Port distribution
+        run: |
+          python - <<'PY'
+          import glob, os, collections
+
+          DEFAULTS = [443, 8443, 2053, 2083, 2096]
+          MAIN = [443, 8443]
+          SKIP = {"requirements.txt", "ip.txt", "count.txt",
+                  "name.txt", "recheck_summary.txt"}
+
+          grand = collections.Counter()
+          rows = []
+
+          for path in sorted(glob.glob("result_repo/*.txt")):
+              base = os.path.basename(path)
+              if base in SKIP:
+                  continue
+              c = collections.Counter()
+              bad = 0
+              with open(path, encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          addr = line.split("#")[0]
+                          port = int(addr.rsplit(":", 1)[1])
+                      except Exception:
+                          bad += 1
+                          continue
+                      c[port] += 1
+              if not c:
+                  continue
+              grand.update(c)
+              rows.append((base, c, bad))
+
+          def report(label, c, bad=0):
+              total = sum(c.values())
+              main = sum(c[p] for p in MAIN)
+              dflt = sum(c[p] for p in DEFAULTS)
+              extra = {p: n for p, n in c.items() if p not in DEFAULTS}
+              en = sum(extra.values())
+              print(f"\n=== {label} | 合计 {total:,} 条"
+                    f"{f' | 解析失败 {bad}' if bad else ''}")
+              print(f"    443+8443        {main:>6,}  {main/total*100:5.1f}%")
+              print(f"    默认5端口合计     {dflt:>6,}  {dflt/total*100:5.1f}%")
+              print(f"    非默认端口       {en:>6,}  {en/total*100:5.1f}%"
+                    f"  （{len(extra)} 个端口）")
+              if extra:
+                  v = sorted(extra.values(), reverse=True)
+                  mid = v[len(v)//2]
+                  avg_e = en / len(extra)
+                  print(f"      单端口产出: 最高 {v[0]} / 中位 {mid} / 最低 {v[-1]}"
+                        f" | 均值 {avg_e:.1f}")
+                  if dflt:
+                      per_d = dflt / len(DEFAULTS)
+                      print(f"      每端口均产出: 默认 {per_d:.1f} vs "
+                            f"非默认 {avg_e:.1f}（比 {per_d/avg_e:.0f}:1）")
+
+          for base, c, bad in sorted(rows, key=lambda r: -sum(r[1].values())):
+              report(base, c, bad)
+
+          print("\n" + "=" * 60)
+          report("全部文件汇总", grand)
+          PY
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf result_repo
