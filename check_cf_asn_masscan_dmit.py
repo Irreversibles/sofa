@@ -124,7 +124,11 @@ SSL_CTX.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
 
 
 def _safe_filename(name):
-    cleaned = re.sub(r'[^\w.-]', '_', name).strip('._')
+    # 允许空格：私库里已有 "Dream Cloud.txt"、"Coaxial Cable.txt" 这类
+    # 带空格的历史文件，转成下划线会另建新文件、劈开累积。
+    # 所有 shell 引用都加了引号（cp "$f" / git add "$f" / read -r f），空格安全。
+    cleaned = re.sub(r'[^\w.\- ]', '_', name)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip(' ._')
     return cleaned or "RESULT"
 
 
