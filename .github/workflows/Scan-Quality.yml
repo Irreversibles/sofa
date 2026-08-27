@@ -1,0 +1,258 @@
+name: Scan Quality (China-optimized routes, 7 ASNs)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 23:00 UTC（北京 07:00）。本线用独立的 quality_ports_state.json，
+    # 不写 dmit_ports_state.json，所以不受 DMIT/LongTail/xTom 那个 8 小时
+    # 等距窗口的约束，只需避开 .txt 推送高峰：xTom 19:00 跑约 3 小时到
+    # 22:00，Alibaba 次日 01:00，23:00 起跑约 70 分钟落在空档里。
+    - cron: '0 23 * * *'
+
+concurrency:
+  group: scan-quality
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y masscan
+
+      - name: Pull old results + port state
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          cp result_repo/quality_ports_state.json ./ 2>/dev/null || true
+          # 分文件模式必须先把全部历史结果拉下来：write_result_file 靠本地
+          # 已有文件触发防覆盖保护，缺文件会导致 old_count=0、保护不触发，
+          # 用只含本轮结果的版本覆盖掉私库累积。推送时只推 scan_out_files.txt
+          # 里列出的，不会误伤别的线。
+          shopt -s nullglob
+          for f in result_repo/*.txt; do
+            case "$(basename "$f")" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+            esac
+            cp "$f" ./ 2>/dev/null || true
+          done
+
+      # 这七个 ASN 是按 BGP 邻居关系筛的：和 AS4809(电信CN2 GIA) /
+      # AS58453(移动CMI) / AS23764(CTG) / AS10099(CUG) 有直接邻居关系，
+      # 也就是中国回程走优化线路。判据是路由事实，不是商家宣传。
+      #   AS7488 + AS40065  CNServer   CN2 GIA + CTG + CMI（同一家两个 ASN）
+      #   AS18186           Nebula     CTG + CUG + CMI
+      #   AS137897          PAN-LIAN   CMI
+      #   AS46783           EASYLINK   CUG
+      #   AS211392          DreamCloud CTG + CMI
+      #   AS142111          Aiyun      CN2 GIA（只有一个 /23，512 IP）
+      # 合计约 116 万 IP，AS40065 一家占 65%。
+      #
+      # 只扫 5 个默认端口（PORTS_MAX_TOTAL=5）：实测十二家的非默认端口
+      # 每个平均只产出 1-3 条，而默认端口每个几十到几百条，比值 10:1 到
+      # 118:1。5 个端口约 65 分钟一轮，可以每天跑。
+      # 本线 state 里没有端口档案（采集只写 dmit_ports_state.json），
+      # 所以轮转池为空、phase=空池，正好只扫默认端口。将来想加轮转就把
+      # STATE_FILE 换成 dmit_ports_state.json 并排进那个 8 小时窗口。
+      - name: Build port list + cadence decision
+        env:
+          STATE_FILE: "quality_ports_state.json"
+          ASN: "7488,40065,18186,137897,46783,211392,142111"
+          DEFAULT_PORTS: "443,8443,2053,2083,2096"
+          SCAN_BUDGET_MIN: "170"
+          # 5000pps 实测吞吐（LongTail 线：12,383,232 目标 / 138.8 分钟）
+          TCP_THROUGHPUT: "89248"
+          THROUGHPUT_SAFETY: "0.85"
+          EMA_ALPHA: "0.5"
+          PORTS_MIN_TOTAL: "5"
+          PORTS_MAX_TOTAL: "5"
+          CADENCE_CYCLE1_DAYS: "1"
+          CADENCE_CYCLE2_DAYS: "1"
+          CADENCE_CYCLE4_DAYS: "1"
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python build_dmit_ports.py
+
+      # ASN_NAMES 分文件输出。AS7488 和 AS40065 是同一家（CNServer LLC /
+      # CNSERVERS LLC），映射到同一个名字合并写 CNSERVERS.txt。
+      # "Dream Cloud" 带空格，对应私库已有的 Dream Cloud.txt —— 需要
+      # check_cf_asn_masscan_dmit.py 的 _safe_filename 放行空格，
+      # 否则会另建 Dream_Cloud.txt 劈开那 8 条历史。
+      #
+      # rate 5000：masscan 打乱目标顺序，每家实际承受 ≈ 5000 × IP 占比。
+      # 最大的 AS40065 占 65%（约 3270pps 摊在 76 万 IP 上），Nebula 占
+      # 29%（约 1460pps / 34 万 IP），单 IP 压力比 xTom 那条线低。
+      - name: Run Scan
+        id: scan
+        if: env.SHOULD_RUN == 'true'
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          CHECK_API: ${{ secrets.CHECK_API }}
+          MASK_PORT_LOG: "1"
+          SCAN_DEADLINE_MIN: "170"
+          MASSCAN_RATE: "5000"
+          MASSCAN_RETRIES: "2"
+          MASSCAN_WAIT: "5"
+          ASN_NAMES: >-
+            7488=CNSERVERS,40065=CNSERVERS,18186=Nebula,
+            137897=PAN-LIAN,46783=EASYLINK,211392=Dream Cloud,
+            142111=Aiyun
+        run: |
+          echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
+          python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "Quality" "${MERGED_PORTS}"
+
+      # ASN 继承 build 写出的 SCAN_TARGET，不重复维护第二份列表。
+      # 本线端口池为空，finalize 主要作用是 EMA 校准吞吐 + 记录 last_scan_ts。
+      - name: Finalize port rotation
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
+        env:
+          STATE_FILE: "quality_ports_state.json"
+          ASN: ${{ env.SCAN_TARGET }}
+        run: python build_dmit_ports.py --finalize
+
+      - name: Push port state (always)
+        if: always()
+        run: |
+          test -d result_repo || exit 0
+          test -f quality_ports_state.json || exit 0
+
+          cp quality_ports_state.json result_repo/
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add quality_ports_state.json
+
+          if git diff --staged --quiet; then
+            echo "no state change"
+            exit 0
+          fi
+
+          git commit -m "auto: update quality port state"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "state push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.json) git checkout --theirs "$f" || true ;;
+                    *)      sort -u "$f" -o "$f" ;;
+                  esac
+                  git add "$f"
+                done
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      # 产出文件名由脚本写在 scan_out_files.txt 里，逐个 cp/add。
+      # 不用通配符：pull 阶段拉了全部 .txt，通配会把别的线的旧副本一起
+      # 提交，若期间它们推了新结果就会被回滚。文件名可能含空格，
+      # 所有引用都加引号、read -r 读取。
+      - name: Push results
+        if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
+        run: |
+          if [ ! -s scan_out_files.txt ]; then
+            echo "本轮无产出文件，跳过推送"
+            exit 0
+          fi
+
+          while read -r f; do
+            [ -z "$f" ] && continue
+            [ -s "$f" ] || continue
+            cp "$f" result_repo/
+          done < scan_out_files.txt
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          while read -r f; do
+            [ -z "$f" ] && continue
+            git add "$f" 2>/dev/null || true
+          done < ../scan_out_files.txt
+
+          if git diff --staged --quiet; then
+            echo "no change"
+            exit 0
+          fi
+
+          git commit -m "auto: update quality results"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              # .txt 是行集合、顺序无关，sort -u 取并集安全
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              ABORT=0
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.txt)  sort -u "$f" -o "$f"; git add "$f" ;;
+                    *.json) git checkout --theirs "$f" || true; git add "$f" ;;
+                    *)      ABORT=1; break ;;
+                  esac
+                done
+              fi
+              if [ "$ABORT" = "1" ]; then
+                git rebase --abort 2>/dev/null || true
+              elif [ -n "$CONFLICTS" ]; then
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Cleanup local sensitive files
+        if: always()
+        run: |
+          rm -f quality_ports_state.json
+          rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -f scan_out_files.txt
+          rm -rf .tmp
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          TRUNC=$(cat scan_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全"
+
+          if [ "${{ job.status }}" != "success" ]; then
+            MSG="❌ 扫描失败%0A分组: 优质线路 (7 个 ASN)%0A状态: ${{ job.status }}"
+          elif [ "${SHOULD_RUN:-false}" != "true" ]; then
+            MSG="⏭️ 本次跳过%0A分组: 优质线路 (7 个 ASN)%0A间隔 ${CADENCE_DAYS:-?} 天"
+          else
+            MSG="✅ 扫描完成%0A分组: 优质线路 (7 个 ASN)%0A端口: ${MERGED_PORTS_COUNT:-?}（仅默认）%0A本次新增: ${COUNT} 个${WARN}"
+          fi
+
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}")
+
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
