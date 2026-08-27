@@ -58,17 +58,18 @@ jobs:
       # 消息里出现的每个 ASN 都写进对应桶）。这里只读档案、选端口。
       #
       # 14 个 ASN 是长尾里消息条数 ≥6 的（bot 发得越勤 = 那个 ASN 上
-      # 越确实有人在用 CF 反代）。合计约 45.7 万 IP，是 xTom 的 4 倍。
-      # build 合并 14 桶端口池，扫描器合并 14 者 IP 段。主桶 61112
+      # 越确实有人在用 CF 反代）。合计约 45.7 万 IP。主桶 61112
       # （AkileCloud，77 条消息、57 端口）存轮转进度和吞吐 EMA。
+      #
+      # 这里是本线 ASN 列表的唯一定义处，finalize 继承 SCAN_TARGET。
       - name: Build port list + cadence decision
         env:
           STATE_FILE: "dmit_ports_state.json"
           ASN: "61112,212336,139659,63473,149440,6134,932,967,400464,63150,1054,38136,26383,138997"
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           SCAN_BUDGET_MIN: "170"
-          # 3000pps 的吞吐初值：5000pps 实测 87,604、2000pps 实测 35,673，线性插值
-          TCP_THROUGHPUT: "53000"
+          # 5000pps 实测吞吐（DMIT 线：4,474,880 目标 / 51.1 分钟）
+          TCP_THROUGHPUT: "87604"
           THROUGHPUT_SAFETY: "0.85"
           EMA_ALPHA: "0.5"
           PORTS_MIN_TOTAL: "10"
@@ -81,8 +82,12 @@ jobs:
 
       # ASN_NAMES 触发分文件输出：这条线里是 12 家不同服务商，不能像
       # DMIT/xTom 那样共用一个标签。同一服务商的多个 ASN 映射到同一名字，
-      # 结果会合并进一个文件（AS967+AS400464=VMISS，AS6134+AS932=XNNET）。
+      # 结果合并进一个文件（AS967+AS400464=VMISS，AS6134+AS932=XNNET）。
       # 未列出的 ASN 兜底用 AS{num}.txt。argv[2] 此模式下只写 name.txt。
+      #
+      # rate 5000 对这条线并不激进：masscan 打乱目标顺序，每家实际承受
+      # ≈ 5000 × 它的 IP 占比。最大的 XNNET 占 23.7%（约 1180pps），
+      # 比 xTom 那条线单家承受的 2000pps 还轻。
       - name: Run Scan
         id: scan
         if: env.SHOULD_RUN == 'true'
@@ -91,7 +96,7 @@ jobs:
           CHECK_API: ${{ secrets.CHECK_API }}
           MASK_PORT_LOG: "1"
           SCAN_DEADLINE_MIN: "300"
-          MASSCAN_RATE: "3000"
+          MASSCAN_RATE: "5000"
           MASSCAN_RETRIES: "2"
           MASSCAN_WAIT: "5"
           ASN_NAMES: >-
@@ -103,12 +108,14 @@ jobs:
           echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
           python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "LongTail" "${MERGED_PORTS}"
 
-      # ASN 必须和 build 完全一致，否则副桶的 last_scanned 标记不上
+      # ASN 继承 build 写出的 SCAN_TARGET，不重复维护第二份列表 ——
+      # 两处一旦不一致，缺失桶的 last_scanned 标不上，那些端口会被无限
+      # 重选、轮转永不推进，且日志看不出异常。
       - name: Finalize port rotation
         if: env.SHOULD_RUN == 'true' && steps.scan.outcome == 'success'
         env:
           STATE_FILE: "dmit_ports_state.json"
-          ASN: "61112,212336,139659,63473,149440,6134,932,967,400464,63150,1054,38136,26383,138997"
+          ASN: ${{ env.SCAN_TARGET }}
         run: python build_dmit_ports.py --finalize
 
       - name: Push port state (always)
