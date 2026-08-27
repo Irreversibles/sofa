@@ -3,11 +3,15 @@ name: Scan LongTail (14 high-frequency small ASNs)
 on:
   workflow_dispatch:
   schedule:
-    # 每天 UTC 12:00 触发，是否执行由 build 的 SHOULD_RUN 决定。
-    # 必须避开 DMIT(02:20) 和 xTom(20:00) —— 只有这三条线写
-    # dmit_ports_state.json，重叠会造成 JSON 冲突、rebase 解不了。
-    # 与 Alibaba(13:00) 只是 push 竞争，不同文件，重试逻辑能处理。
-    - cron: '0 12 * * *'
+    # 每天 11:00 UTC 触发，是否执行由 build 的 SHOULD_RUN 决定。
+    #
+    # DMIT / xTom / LongTail 三条线共写 dmit_ports_state.json，按 8 小时
+    # 等距排开：DMIT 02:20 → LongTail 11:00 → xTom 19:00。间隔都大于
+    # timeout-minutes 350（5h50m），跑满上限也不会重叠。
+    # 11:00 还避开了 Tencent（周一四 10:00，48 分钟到 10:48）。
+    # 与 Alibaba(13:00) / Google(16:00) 只是 push 竞争，文件不同，
+    # 重试逻辑能处理。
+    - cron: '0 11 * * *'
 
 concurrency:
   group: scan-longtail
