@@ -1,4 +1,4 @@
-name: Scan DMIT (AS906+AS32519 masscan + budget-driven + cycle cadence)
+name: Scan DMIT
 
 on:
   workflow_dispatch:
