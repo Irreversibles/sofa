@@ -11,12 +11,22 @@ masscan 探活 + asyncio 三阶段 TLS + API 确认。
 不设 SCAN_DEADLINE_MIN 时闸门关闭，可当普通 masscan 脚本用。
 
 目标/名字/端口全由 argv 传入，实现是通用的（文件名带 dmit 只是历史原因），
-DMIT 和 xTom 等多条线共用本脚本。第一个参数支持逗号分隔多 ASN 或 CIDR。
+DMIT / xTom / 长尾等多条线共用本脚本。第一个参数支持逗号分隔多 ASN 或 CIDR。
+
+单文件 vs 分文件输出：
+  不设 ASN_NAMES → 全部结果写 {argv[2]}.txt，标签统一。DMIT、xTom 用这个，
+      因为一条线内的多个 ASN 属于同一家服务商。
+  设了 ASN_NAMES → 按 IP 归属的服务商分组，各写 {服务商名}.txt，标签用各自
+      的名字。长尾线用这个，一条线内是十几家不同服务商。
+      格式 ASN_NAMES="61112=AkileCloud,967=VMISS,400464=VMISS"，
+      多个 ASN 可映射到同一名字（同服务商的多个 ASN 合并成一个文件）；
+      未列出的 ASN 兜底用 AS{num}.txt。
 
 日志不输出任何 IP：本仓库公开，Actions 日志虽不进代码搜索索引但登录可见。
 结果只写入文件、推送私库。
 """
 import asyncio
+import bisect
 import ssl
 import sys
 import os
@@ -31,7 +41,7 @@ import threading
 import subprocess
 import urllib.parse
 import urllib.request
-from collections import Counter
+from collections import Counter, defaultdict
 from functools import lru_cache
 
 import aiohttp
@@ -64,10 +74,12 @@ DEFAULT_NAME = os.getenv("NAME_LABEL", "DMIT")
 DEFAULT_PORTS = os.getenv("PORTS", "443,8443,2053,2083,2096")
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 MASK_PORT_LOG = os.getenv("MASK_PORT_LOG", "0") == "1"
+ASN_NAMES_RAW = os.getenv("ASN_NAMES", "").strip()
 
 TMP_DIR = ".tmp"
 TARGETS_FILE = os.path.join(TMP_DIR, "targets.txt")
 MASSCAN_OUT = os.path.join(TMP_DIR, "masscan_out.json")
+OUT_FILES_LIST = "scan_out_files.txt"
 
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
@@ -116,6 +128,24 @@ def _safe_filename(name):
     return cleaned or "RESULT"
 
 
+def parse_asn_names(raw):
+    """解析 ASN_NAMES="61112=AkileCloud,967=VMISS" → {"61112": "AkileCloud", ...}
+
+    允许多个 ASN 指向同一名字（同服务商多 ASN 合并输出）。
+    """
+    mapping = {}
+    for item in re.split(r'[,\n]+', raw or ""):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k = k.strip().upper().replace("AS", "")
+        v = _safe_filename(v.strip())
+        if k.isdigit() and v:
+            mapping[k] = v
+    return mapping
+
+
 def pick_ports(port_str):
     if not port_str:
         return [443]
@@ -138,7 +168,7 @@ def pick_ports(port_str):
     return sorted(ports) if ports else [443]
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)
 def get_asn_prefixes(asn_clean):
     cidrs = []
     try:
@@ -173,33 +203,47 @@ def get_asn_prefixes(asn_clean):
 
 
 def build_targets_file(target_input):
+    """写 masscan 目标文件，同时建 IP→ASN 反查表。
+
+    两份数据用途不同：
+      给 masscan 的段做全局 collapse（跨 ASN 合并重叠，扫得最省）
+      反查表按 ASN 各自 collapse（不跨 ASN 合并，否则归属就丢了）
+    返回 (段数, 总IP数, 反查表)。反查表为 (起点列表, 区间列表)，供 bisect 用。
+    """
     os.makedirs(TMP_DIR, exist_ok=True)
-    nets = []
+    by_asn = defaultdict(list)      # asn(str) -> [network]
+    plain_nets = []                 # 直接给的 CIDR，无 ASN 归属
+
     for item in re.split(r'[\s,]+', str(target_input).strip()):
         if not item:
             continue
         try:
             net = ipaddress.ip_network(item, strict=False)
             if net.version == 4:
-                nets.append(net)
+                plain_nets.append(net)
             continue
         except ValueError:
             pass
         asn = item.upper().replace("AS", "").strip()
-        if asn.isdigit():
-            for c in get_asn_prefixes(asn):
-                try:
-                    n = ipaddress.ip_network(c, strict=False)
-                    if n.version == 4:
-                        nets.append(n)
-                except ValueError:
-                    continue
+        if not asn.isdigit():
+            continue
+        for c in get_asn_prefixes(asn):
+            try:
+                n = ipaddress.ip_network(c, strict=False)
+                if n.version == 4:
+                    by_asn[asn].append(n)
+            except ValueError:
+                continue
 
-    if not nets:
-        return [], 0
+    all_nets = list(plain_nets)
+    for v in by_asn.values():
+        all_nets.extend(v)
+    if not all_nets:
+        return 0, 0, None
 
-    before = len(nets)
-    collapsed = sorted(ipaddress.collapse_addresses(nets))
+    # ---- 写给 masscan：全局 collapse ----
+    before = len(all_nets)
+    collapsed = sorted(ipaddress.collapse_addresses(all_nets))
     total_ips = sum(n.num_addresses for n in collapsed)
     if len(collapsed) < before:
         print(f"[*] 段合并去重: {before} → {len(collapsed)} 段", flush=True)
@@ -208,7 +252,36 @@ def build_targets_file(target_input):
         for n in collapsed:
             f.write(str(n) + "\n")
 
-    return collapsed, total_ips
+    # ---- 反查表：ASN 内部 collapse，不跨 ASN ----
+    ranges = []
+    for asn, nets in by_asn.items():
+        for n in ipaddress.collapse_addresses(nets):
+            ranges.append((int(n.network_address), int(n.broadcast_address), asn))
+    ranges.sort()
+    starts = [r[0] for r in ranges]
+    lookup = (starts, ranges) if ranges else None
+
+    return len(collapsed), total_ips, lookup
+
+
+def asn_of_ip(ip, lookup):
+    """反查 IP 属于哪个 ASN。查不到返回 None。
+
+    不跨 ASN collapse 后可能存在嵌套段（A 宣告 /16、B 宣告其中一个 /24），
+    bisect 命中的那个未必包含 v，需继续往前找更大的包含段。段数只有几千、
+    待查 IP 只有几百个，不做剪枝直接走到底也是毫秒级，换取正确性。
+    """
+    if not lookup:
+        return None
+    starts, ranges = lookup
+    v = int(ipaddress.ip_address(ip))
+    i = bisect.bisect_right(starts, v) - 1
+    while i >= 0:
+        s, e, asn = ranges[i]
+        if v <= e:
+            return asn
+        i -= 1
+    return None
 
 
 def run_masscan(ports, deadline_ts=None):
@@ -501,6 +574,45 @@ def filter_blackhole(open_ports, port_total):
     return kept
 
 
+def sort_key(line):
+    try:
+        addr = line.split("#")[0]
+        ip_part, port_part = addr.rsplit(":", 1)
+        country = line.split("#")[1].split()[0] if "#" in line else "??"
+        return (country, ipaddress.ip_address(ip_part), int(port_part))
+    except Exception:
+        return ("??", ipaddress.ip_address("0.0.0.0"), 0)
+
+
+def write_result_file(fname, label, entries):
+    """追加去重写入单个结果文件，带防覆盖保护。
+
+    返回新增条数；触发防覆盖保护时返回 None（不写文件）。
+    注意：依赖 fname 在本地已存在（workflow 必须先从私库拉下来），
+    否则 old_count=0，保护不触发，会用只含本轮结果的文件覆盖历史累积。
+    """
+    old_lines = load_old_lines(fname)
+    old_count = len(old_lines)
+
+    new_count = 0
+    for ip, port, country in entries:
+        line = f"{ip}:{port}#{country} {label}"
+        if line not in old_lines:
+            new_count += 1
+        old_lines.add(line)
+
+    sorted_lines = sorted(old_lines, key=sort_key)
+    if old_count > 20 and len(sorted_lines) < old_count * 0.5:
+        print(f"[!] {fname} 合并后({len(sorted_lines)})远少于原有({old_count})，"
+              f"疑似读取异常，不覆盖！", flush=True)
+        return None
+
+    with open(fname, "w", encoding="utf-8", newline="\n") as f:
+        for line in sorted_lines:
+            f.write(line + "\n")
+    return new_count
+
+
 async def main():
     target_input = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET
     name_arg = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_NAME
@@ -511,13 +623,22 @@ async def main():
             f.write("0")
         return
 
+    asn_names = parse_asn_names(ASN_NAMES_RAW)
+    split_mode = bool(asn_names)
+
     name_label = _safe_filename(name_arg)
     with open("name.txt", "w", encoding="utf-8") as f:
         f.write(name_label)
 
     target_ports = pick_ports(ports_input)
-    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | masscan探活 + asyncio三阶段 + API确认 | "
-          f"名字={name_label}", flush=True)
+    print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | masscan探活 + asyncio三阶段 + API确认",
+          flush=True)
+    if split_mode:
+        uniq_labels = sorted(set(asn_names.values()))
+        print(f"[*] 输出：按服务商分文件 | {len(asn_names)} 个 ASN → "
+              f"{len(uniq_labels)} 个文件", flush=True)
+    else:
+        print(f"[*] 输出：单文件 {name_label}.txt", flush=True)
     if MASK_PORT_LOG:
         print(f"[*] 端口数: {len(target_ports)}（已隐藏）", flush=True)
     else:
@@ -559,18 +680,28 @@ async def main():
         except Exception:
             pass
 
-    # ==================== 阶段零：masscan 探活 ====================
-    print(f"\n[*] 解析目标...", flush=True)
-    nets, total_ips = build_targets_file(target_input)
-    if not nets:
-        print("[-] 未解析到任何 IPv4 目标。", flush=True)
+    def bail(reason=None):
+        """无结果时统一收尾：count 归零、产出文件清单置空、写闸门产物。"""
+        if reason:
+            print(reason, flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
+        with open(OUT_FILES_LIST, "w", encoding="utf-8") as f:
+            pass
         write_scan_artifacts()
+
+    # ==================== 阶段零：masscan 探活 ====================
+    print(f"\n[*] 解析目标...", flush=True)
+    seg_count, total_ips, lookup = build_targets_file(target_input)
+    if not seg_count:
+        bail("[-] 未解析到任何 IPv4 目标。")
+        return
+    if split_mode and not lookup:
+        bail("[-] ASN_NAMES 已设置但未能建立 IP→ASN 映射（目标里没有 ASN？）")
         return
 
     total_scans = total_ips * len(target_ports)
-    print(f"[+] {len(nets)} 段 | {total_ips:,} IP × {len(target_ports)} 端口 "
+    print(f"[+] {seg_count} 段 | {total_ips:,} IP × {len(target_ports)} 端口 "
           f"= {total_scans:,} 次探测", flush=True)
     eta = total_scans * (1 + MASSCAN_RETRIES) / max(MASSCAN_RATE, 1) / 60
     print(f"[*] masscan 预估约 {eta:.0f} 分钟（含 {MASSCAN_RETRIES} 次重传）",
@@ -596,16 +727,10 @@ async def main():
           f"（{int(done_scans):,} 次 / {masscan_elapsed / 60:.1f} 分钟）", flush=True)
 
     if open_ports is None:
-        print("[-] masscan 未能运行，退出。", flush=True)
-        with open("count.txt", "w") as f:
-            f.write("0")
-        write_scan_artifacts()
+        bail("[-] masscan 未能运行，退出。")
         return
     if not open_ports:
-        print("[-] 无开放端口。", flush=True)
-        with open("count.txt", "w") as f:
-            f.write("0")
-        write_scan_artifacts()
+        bail("[-] 无开放端口。")
         return
 
     print(f"[+] 探活完成！开放: {len(open_ports):,} 个"
@@ -631,10 +756,7 @@ async def main():
     pass_1 = [open_ports[i] for i, ok in enumerate(r1) if ok]
     print(f"[+] 第一阶段完成！保留: {len(pass_1):,} 个\n", flush=True)
     if not pass_1:
-        with open("count.txt", "w") as f:
-            f.write("0")
-        write_scan_artifacts()
-        print("[-] 无有效目标通过第一阶段。", flush=True)
+        bail("[-] 无有效目标通过第一阶段。")
         return
 
     # ==================== 第二阶段：crypto 301 ====================
@@ -649,10 +771,7 @@ async def main():
     pass_2 = [pass_1[i] for i, ok in enumerate(r2) if ok]
     print(f"[+] 第二阶段完成！保留: {len(pass_2):,} 个\n", flush=True)
     if not pass_2:
-        with open("count.txt", "w") as f:
-            f.write("0")
-        write_scan_artifacts()
-        print("[-] 无有效目标通过第二阶段。", flush=True)
+        bail("[-] 无有效目标通过第二阶段。")
         return
 
     # ==================== 第三阶段：自定义域名 ====================
@@ -707,55 +826,70 @@ async def main():
         print("[4/4] 未配置 CHECK_API，country 留 ?? 待 recheck 填。", flush=True)
 
     if not api_results:
-        with open("count.txt", "w") as f:
-            f.write("0")
-        write_scan_artifacts()
         print("\n==================== 扫描结束 ====================", flush=True)
-        print("[!] API 确认后无有效结果，不覆盖已有文件。", flush=True)
+        bail("[!] API 确认后无有效结果，不覆盖已有文件。")
         return
 
-    # ==================== 结果输出（追加去重 + 防覆盖保护） ====================
-    output_filename = f"{name_label}.txt"
-    old_lines = load_old_lines(output_filename)
-    old_count = len(old_lines)
+    # ==================== 结果输出 ====================
+    total_new = 0
+    out_files = []
 
-    new_count = 0
-    for ip, port, country in api_results:
-        line = f"{ip}:{port}#{country} {name_label}"
-        if line not in old_lines:
-            new_count += 1
-        old_lines.add(line)
+    if not split_mode:
+        fname = f"{name_label}.txt"
+        n = write_result_file(fname, name_label, api_results)
+        if n is None:
+            bail()      # 防覆盖保护已打印原因
+            return
+        total_new = n
+        out_files.append(fname)
+        print("\n==================== 扫描结束 ====================", flush=True)
+        print(f"本次新增: {total_new} 个", flush=True)
+    else:
+        # 按服务商标签分组（不是按 ASN）：多个 ASN 可映射到同一个名字，
+        # 比如 AS967 和 AS400464 都是 VMISS，合并写一个文件
+        groups = defaultdict(list)
+        label_asns = defaultdict(set)
+        unmapped = 0
+        for ip, port, country in api_results:
+            asn = asn_of_ip(ip, lookup)
+            if asn is None:
+                unmapped += 1
+                label = "_UNKNOWN"
+            else:
+                label = asn_names.get(asn, f"AS{asn}")
+                label_asns[label].add(asn)
+            groups[label].append((ip, port, country))
 
-    def sort_key(line):
-        try:
-            addr = line.split("#")[0]
-            ip_part, port_part = addr.rsplit(":", 1)
-            country = line.split("#")[1].split()[0] if "#" in line else "??"
-            return (country, ipaddress.ip_address(ip_part), int(port_part))
-        except Exception:
-            return ("??", ipaddress.ip_address("0.0.0.0"), 0)
+        print("\n==================== 扫描结束 ====================", flush=True)
+        print(f"[*] 结果分属 {len(groups)} 个服务商", flush=True)
+        if unmapped:
+            # 理论上不该出现：masscan 的目标全部来自这些 ASN 的前缀
+            print(f"[!] {unmapped} 条未能归属到 ASN，已写入 _UNKNOWN.txt 待查",
+                  flush=True)
 
-    sorted_lines = sorted(old_lines, key=sort_key)
+        for label in sorted(groups, key=lambda l: -len(groups[l])):
+            fname = f"{label}.txt"
+            n = write_result_file(fname, label, groups[label])
+            if n is None:
+                continue
+            total_new += n
+            out_files.append(fname)
+            asns = label_asns.get(label)
+            src = f" (AS{'+AS'.join(sorted(asns))})" if asns and len(asns) > 1 else ""
+            print(f"      {label:<22} 本轮 {len(groups[label]):>4} 条 | "
+                  f"新增 {n:>4}{src}", flush=True)
 
-    if old_count > 20 and len(sorted_lines) < old_count * 0.5:
-        print(f"[!] 合并后结果({len(sorted_lines)})远少于原有({old_count})，"
-              f"疑似读取异常，不覆盖！", flush=True)
-        with open("count.txt", "w") as f:
-            f.write("0")
-        write_scan_artifacts()
-        return
-
-    with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
-        for line in sorted_lines:
-            f.write(line + "\n")
+        print(f"[+] 合计新增: {total_new} 个 | 产出 {len(out_files)} 个文件",
+              flush=True)
 
     with open("count.txt", "w") as f:
-        f.write(str(new_count))
+        f.write(str(total_new))
+    with open(OUT_FILES_LIST, "w", encoding="utf-8", newline="\n") as f:
+        for fn in out_files:
+            f.write(fn + "\n")
 
     write_scan_artifacts()
 
-    print("\n==================== 扫描结束 ====================", flush=True)
-    print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
     if pipeline_truncated:
         print("[!] 本轮被时间闸门截断，端口未标记已扫，下轮重扫", flush=True)
     print(f"[+] 结果已保存（追加去重，详见私库）", flush=True)
