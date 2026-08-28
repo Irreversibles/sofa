@@ -2,7 +2,8 @@ name: '定时清理 Actions 历史运行日志'
 
 on:
   schedule:
-    - cron: '0 0 * * 1'
+    # 分钟取 23 而非 0：整点是 GitHub 定时队列最拥挤的时刻，容易被丢弃
+    - cron: '23 0 * * 1'
   workflow_dispatch:
 
 jobs:
@@ -18,4 +19,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           retain_days: 3
-          keep_minimum_runs: 15
+          # 这是"每个 workflow 各保留 N 条"，不是全仓库 N 条。
+          # 原来的 15 让 Recheck（总共才 8 条）整个被豁免，
+          # 所以 8/10 起的日志一条都没删掉。
+          keep_minimum_runs: 5
