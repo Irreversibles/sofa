@@ -3,7 +3,13 @@ name: Recheck IPs
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 */3 * *'   # 每3天一次，UTC 6点（北京14点）
+    # 每天触发，实际跑不跑由下面的 cadence 闸门按时间戳判定。
+    # 不用 '*/3'：那在 day-of-month 里展开成固定日期 1,4,7,...,28,31，
+    # 月末会重置 —— 31 号跑完 1 号又跑（隔 1 天），2 月更明显。
+    # 而且 GitHub 高负载时会直接丢弃 scheduled 事件且不补偿，用 */3 被丢
+    # 一次就要等到第 6 天。每天敲门 + 闸门放行，节奏才真正稳定在 3 天。
+    # 分钟取 17 而非 0：整点是队列最拥挤的时刻，被丢概率明显更高。
+    - cron: '17 6 * * *'
 
 concurrency:
   group: recheck
@@ -36,17 +42,50 @@ jobs:
             cp "$f" ./ 2>/dev/null || true
           done
 
+      # 时间戳存私库 recheck_state.json（clone 时一并拉下，直接读 result_repo/）。
+      # 只在复验成功后才更新，所以失败或被闸门跳过的轮次不推进节奏，第二天会重试。
+      - name: Cadence gate
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          # 阈值取 66 小时而不是 72：GitHub 定时普遍延迟 20-40 分钟，若按 72
+          # 卡死，上轮延迟到 06:45、本轮 06:20 触发就只有 71.6 小时 → 判跳过
+          # → 顺延到第 4 天，之后每次往后漂。66 留足余量，实际间隔仍是 3 天。
+          MIN_HOURS: '66'
+        run: |
+          python - <<'PY'
+          import json, os, time
+          force = os.environ.get("FORCE") == "1"
+          min_h = float(os.environ.get("MIN_HOURS", "66"))
+          try:
+              with open("result_repo/recheck_state.json", encoding="utf-8") as f:
+                  last = float(json.load(f).get("last_run_ts", 0))
+          except Exception:
+              last = 0.0
+          elapsed = (time.time() - last) / 3600 if last else float("inf")
+          run = force or elapsed >= min_h
+          if last:
+              print(f"[*] 距上次复验 {elapsed:.1f} 小时（阈值 {min_h}）")
+          else:
+              print("[*] 无历史记录，首次运行")
+          print(f"[*] 本轮{'执行' if run else '跳过'}"
+                f"{'（手动强制）' if force and elapsed < min_h else ''}")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"SHOULD_RUN={'true' if run else 'false'}\n")
+              f.write(f"ELAPSED_H={elapsed if last else -1:.1f}\n")
+          PY
+
       - name: Recheck
+        if: env.SHOULD_RUN == 'true'
         env:
           CHECK_API: ${{ secrets.CHECK_API }}
-          # 比 job 的 120 分钟留 20 分钟余量：job 级 timeout 会取消整个
-          # job，后续步骤即使 if: always() 也不执行，等于整轮结果全丢。
+          # 比 job 的 120 分钟留 20 分钟余量：job 级 timeout 会取消整个 job，
+          # 后续步骤即使 if: always() 也不执行，等于整轮结果全丢。
           RECHECK_DEADLINE_MIN: "100"
         run: |
           shopt -s nullglob
           # 必须用数组：结果文件名含空格（Dream Cloud.txt / Coaxial Cable.txt
-          # / BACK WAVES.txt），拼成字符串后无引号展开会被按空格拆成多个
-          # 参数，脚本只会报"文件不存在"然后跳过 —— 这三个文件此前一直没被复验。
+          # / BACK WAVES.txt），拼成字符串后无引号展开会被按空格拆成多个参数，
+          # 脚本只报"文件不存在"然后跳过 —— 这三个文件此前一直没被复验。
           FILES=()
           for f in *.txt; do
             case "$f" in
@@ -65,7 +104,13 @@ jobs:
             cat recheck_summary.txt
           fi
 
+      - name: Stamp cadence state
+        if: env.SHOULD_RUN == 'true' && success()
+        run: |
+          python -c "import json,time;json.dump({'last_run_ts':time.time()},open('result_repo/recheck_state.json','w'))"
+
       - name: Push back
+        if: env.SHOULD_RUN == 'true'
         run: |
           shopt -s nullglob
           for f in *.txt; do
@@ -78,6 +123,8 @@ jobs:
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+
+          git add recheck_state.json || true
 
           # 精确 add 结果文件，不用 git add -A。
           # -A 会把 clone 时拉到的旧副本一起提交，若期间有 scan workflow
@@ -111,7 +158,11 @@ jobs:
           WARN=""
           [ "$TRUNC" = "1" ] && WARN=$'\n⚠️ 触及时间闸门，剩余文件下轮继续'
 
-          if [ "${{ job.status }}" != "success" ]; then
+          if [ "${SHOULD_RUN:-true}" != "true" ]; then
+            # 每天触发但只有满 66 小时才复验，跳过是常态。
+            # 不想每天收这条就把下面两行换成 exit 0。
+            MSG=$(printf '⏭️ 复验跳过\n距上次 %s 小时，未满 3 天' "${ELAPSED_H}")
+          elif [ "${{ job.status }}" != "success" ]; then
             MSG=$(printf '❌ 大号复验失败\n状态: %s' "${{ job.status }}")
           elif [ -s recheck_summary.txt ]; then
             DETAILS=$(awk -F: '
