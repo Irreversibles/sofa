@@ -2,6 +2,7 @@ import asyncio
 import sys
 import os
 import ipaddress
+import time
 import urllib.parse
 
 import aiohttp
@@ -17,6 +18,17 @@ API_RETRY = 2                 # API 异常时的重试次数
 MIN_SURVIVE_RATIO = 0.15      # 存活率过低不覆盖（防API抽风误删）
 API_ERROR_ABORT_RATIO = 0.3   # API异常占比超过此值 → 判定故障，整个文件不动
 
+# 存活率保护的最小判定数：只有 1-2 条的文件（RESULT.txt 等）一旦全部失效，
+# 存活率 0% 永远低于阈值 → 永不覆盖 → 死条目永久滞留。样本太小时统计
+# 不显著，不套用该保护，交给"API异常占比"那道闸把关。
+MIN_JUDGED_FOR_RATIO = 10
+
+# 时间闸门：job 级 timeout 会取消整个 job，后续步骤即使标了 always() 也
+# 不执行 —— 也就是整轮复验的结果全部丢失。所以必须在脚本内部留出余量，
+# 到点就收工：已处理的文件正常写回、正常推送，剩余文件下轮继续。
+DEADLINE_MIN = int(os.getenv("RECHECK_DEADLINE_MIN", "100"))
+_START = time.monotonic()
+
 SKIP_FILES = {"count.txt", "name.txt", "requirements.txt",
               "ip.txt", "recheck_summary.txt"}
 
@@ -24,6 +36,10 @@ SKIP_FILES = {"count.txt", "name.txt", "requirements.txt",
 # 这些国家的条目不参与复验、不剔除、不被探测，原样保留。
 # 这里用于跳过 CN Alibaba，避免自己扫出的国内IP被误判剔除。
 KEEP_COUNTRIES = {"CN"}
+
+
+def out_of_time():
+    return (time.monotonic() - _START) / 60 >= DEADLINE_MIN
 
 
 def parse_line(line):
@@ -125,10 +141,20 @@ async def main():
         return
 
     sem = asyncio.Semaphore(CONCURRENCY)
-    removed_summary = {}
+    summary = {}          # stem -> (剔除数, API异常数)
+    truncated = False
+
+    print(f"[*] 时间闸门: {DEADLINE_MIN} 分钟（到点收工，剩余文件下轮继续）",
+          flush=True)
 
     async with aiohttp.ClientSession() as session:
         for fname in sys.argv[1:]:
+            if out_of_time():
+                truncated = True
+                print(f"\n[!] 已达 {DEADLINE_MIN} 分钟闸门，剩余文件本轮不处理"
+                      f"（已处理的正常写回，下轮继续）", flush=True)
+                break
+
             base = os.path.basename(fname)
             stem = base[:-4] if base.lower().endswith(".txt") else base
             if stem.lower().endswith("-old"):
@@ -196,21 +222,27 @@ async def main():
             if err_ratio > API_ERROR_ABORT_RATIO:
                 print(f"[!] API 异常占比 {err_ratio*100:.1f}%，疑似 API 故障"
                       f"（超额/1027/Worker异常），跳过 {fname}，不做任何变更。", flush=True)
+                summary[stem] = (0, len(unknown))
                 continue
 
             # 保护二：存活率过低 → 不覆盖（分母排除 API 异常的）
             judged = alive_count + len(dead)
-            if judged and alive_count / judged < MIN_SURVIVE_RATIO:
+            if judged >= MIN_JUDGED_FOR_RATIO and \
+                    alive_count / judged < MIN_SURVIVE_RATIO:
                 print(f"[!] 存活率低于 {MIN_SURVIVE_RATIO*100:.0f}%，"
                       f"疑似异常，不覆盖 {fname}。", flush=True)
+                summary[stem] = (0, len(unknown))
                 continue
 
             removed = len(dead)
+            if removed or unknown:
+                summary[stem] = (removed, len(unknown))
             if removed > 0:
-                removed_summary[stem] = removed
-                print(f"  [剔除明细]", flush=True)
-                for ip, port, _ in dead:
-                    print(f"    - {ip}:{port}", flush=True)
+                # 不逐个列 ip:port —— 公开仓库的 Actions 日志登录可见，
+                # 剔除项是"曾经有效过"的 proxyip，参考价值不低，
+                # 和扫描线设 MASK_PORT_LOG=1 的意图一致。
+                nports = len({p for _, p, _ in dead})
+                print(f"  [剔除] {removed} 条，涉及 {nports} 个端口", flush=True)
 
             out_lines = set(keep_lines)   # CN 及无效行原样写回
             for ip, port, country, name in alive:
@@ -226,9 +258,13 @@ async def main():
                   f"保留 {len(out_lines)} 个"
                   f"（含 {skipped} 个保留国家 + {len(unknown)} 个待下轮复验）。", flush=True)
 
+    # 格式 stem:剔除数:API异常数（异常数供发现"常年判不出来"的条目）
     with open("recheck_summary.txt", "w", encoding="utf-8") as f:
-        for name, count in removed_summary.items():
-            f.write(f"{name}:{count}\n")
+        for name, (removed, unk) in summary.items():
+            f.write(f"{name}:{removed}:{unk}\n")
+
+    with open("recheck_truncated.txt", "w", encoding="utf-8") as f:
+        f.write("1" if truncated else "0")
 
 
 if __name__ == "__main__":
