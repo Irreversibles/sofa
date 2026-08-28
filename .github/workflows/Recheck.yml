@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read        # 只往私库推（用 RESULT_REPO_TOKEN），不写本库
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,34 +39,38 @@ jobs:
       - name: Recheck
         env:
           CHECK_API: ${{ secrets.CHECK_API }}
+          # 比 job 的 120 分钟留 20 分钟余量：job 级 timeout 会取消整个
+          # job，后续步骤即使 if: always() 也不执行，等于整轮结果全丢。
+          RECHECK_DEADLINE_MIN: "100"
         run: |
           shopt -s nullglob
-          FILES=""
+          # 必须用数组：结果文件名含空格（Dream Cloud.txt / Coaxial Cable.txt
+          # / BACK WAVES.txt），拼成字符串后无引号展开会被按空格拆成多个
+          # 参数，脚本只会报"文件不存在"然后跳过 —— 这三个文件此前一直没被复验。
+          FILES=()
           for f in *.txt; do
             case "$f" in
               requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
             esac
-            FILES="$FILES $f"
+            FILES+=("$f")
           done
-          echo "复验文件: $FILES"
-          if [ -n "$FILES" ]; then
-            python recheck_api.py $FILES
+          echo "复验 ${#FILES[@]} 个文件"
+          if [ ${#FILES[@]} -gt 0 ]; then
+            python recheck_api.py "${FILES[@]}"
           else
             echo "没有可复验的文件"
           fi
           if [ -s recheck_summary.txt ]; then
-            echo "剔除摘要："
+            echo "剔除摘要（文件:剔除数:API异常数）："
             cat recheck_summary.txt
           fi
 
       - name: Push back
-        env:
-          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           shopt -s nullglob
           for f in *.txt; do
             case "$f" in
-              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;;
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt|recheck_truncated.txt) continue ;;
             esac
             cp "$f" result_repo/ 2>/dev/null || true
           done
@@ -90,6 +94,8 @@ jobs:
             echo "no change"
           else
             git commit -m "recheck: 剔除失效IP + 更新落地"
+            # 这里不能用 sort -u 合并冲突：recheck 是要删行的，取并集
+            # 会让刚剔除的失效条目复活。冲突就退出，下轮再来。
             for i in 1 2 3 4 5; do
               git push && break
               echo "push 冲突，第 $i 次重试..."
@@ -101,18 +107,29 @@ jobs:
       - name: Notify TG
         if: always()
         run: |
-          if [ -s recheck_summary.txt ]; then
+          TRUNC=$(cat recheck_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN=$'\n⚠️ 触及时间闸门，剩余文件下轮继续'
+
+          if [ "${{ job.status }}" != "success" ]; then
+            MSG=$(printf '❌ 大号复验失败\n状态: %s' "${{ job.status }}")
+          elif [ -s recheck_summary.txt ]; then
             DETAILS=$(awk -F: '
-              { total += $2; printf "  • %s：%s 个\n", $1, $2 }
-              END { printf "合计剔除 %d 个", total }
+              { rm += $2; unk += $3
+                if ($2 > 0)
+                  printf "  • %s：剔除 %s 个%s\n", $1, $2, \
+                         ($3 > 0 ? " (另 " $3 " 条API异常)" : "")
+                else if ($3 > 0)
+                  printf "  • %s：%s 条API异常待下轮\n", $1, $3
+              }
+              END {
+                printf "合计剔除 %d 个", rm
+                if (unk > 0) printf "，%d 条API异常待下轮", unk
+              }
             ' recheck_summary.txt)
-            MSG=$(printf '🔄 大号复验完成，已剔除失效IP：\n%s' "$DETAILS")
+            MSG=$(printf '🔄 大号复验完成\n%s%s' "$DETAILS" "$WARN")
           else
-            if [ "${{ job.status }}" = "success" ]; then
-              MSG="🔄 大号复验完成，无失效IP需剔除"
-            else
-              MSG=$(printf '❌ 大号复验失败\n状态: %s' "${{ job.status }}")
-            fi
+            MSG=$(printf '🔄 大号复验完成，无失效IP需剔除%s' "$WARN")
           fi
           curl -sS -X POST \
             "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
