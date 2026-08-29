@@ -15,7 +15,7 @@ on:
         description: '目标 IP 上限，超出按段顺序截断。0=不限'
         required: false
         default: '12000000'
-  schedule:
+  #schedule:
     # 周二/周五 08:37 UTC（北京 16:37）。
     #
     # 选这个时段的理由：
@@ -35,7 +35,7 @@ on:
     # 来源方（GitHub），低频直接降低暴露面。
     #
     # 分钟取 37 而非 0：整点是 GitHub 定时队列最拥挤的时刻，被丢弃概率高。
-    - cron: '37 8 * * 2,5'
+    #- cron: '37 8 * * 2,5'
 
 concurrency:
   group: scan-aws
