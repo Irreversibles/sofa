@@ -8,13 +8,13 @@ on:
         required: false
         default: '443'
       rate:
-        description: 'masscan pps。AWS 是云厂商，5000-10000 安全'
+        description: 'masscan pps。实测 10000 稳定跑满且未被限速，别降'
         required: false
         default: '10000'
       max_ips:
         description: '目标 IP 上限，超出按段顺序截断。0=不限'
         required: false
-        default: '19000000'
+        default: '12000000'
   schedule:
     # 周二/周五 08:37 UTC（北京 16:37）。
     #
@@ -23,7 +23,7 @@ on:
     #     硬要求。两边都要打 CHECK_API，撞上会把 Worker 配额吃光，导致
     #     recheck 侧 API 异常占比破 30%（API_ERROR_ABORT_RATIO），整轮复验
     #     被静默跳过，而 TG 通知仍显示"完成"，只有日志里看得出来。
-    #   DMIT(02:20 起) 3 天一次，实际约 2 小时结束，闸门最坏 08:10。
+    #   DMIT(02:20 起) 3 天一次，闸门最坏 08:10。
     #   后面 LongTail 11:00 起，前 10 分钟在装依赖/clone/选端口，不打 API。
     #   周二/周五避开 Tencent（周一四 10:00）。
     #
@@ -31,10 +31,9 @@ on:
     # dmit_ports_state.json 的 JSON 冲突，所以不受 DMIT/LongTail/xTom
     # 那个 8 小时等距窗口的约束，只需避开 CHECK_API 竞争。
     #
-    # 频率 2 天一次而非每天：AWS 产出密度未知（不像长尾线有 TG 消息条数、
-    # Quality 线有 BGP 邻居关系作依据），先低频量几轮产出比再决定是否提频；
-    # 且 AWS abuse 团队比小商家积极，投诉发给流量来源方（GitHub），
-    # 低频直接降低暴露面。
+    # 频率 2 天一次而非每天：首轮 930 条全算新增只因 AWS.txt 原本不存在，
+    # 真实增量要等第二轮才看得出。且 AWS abuse 团队比小商家积极，投诉发给
+    # 流量来源方（GitHub），低频直接降低暴露面。
     #
     # 分钟取 37 而非 0：整点是 GitHub 定时队列最拥挤的时刻，被丢弃概率高。
     - cron: '37 8 * * 2,5'
@@ -46,8 +45,8 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    # 170 而非 350：本线要塞进 Recheck 收工(08:00) 到 LongTail 进 masscan
-    # 之间的空档。脚本内闸门 140 分钟，余下 30 分钟给装依赖、clone、push 重试。
+    # 首轮实测 1h24m41s（masscan 42.8min + TLS/API 约 34min + 依赖&推送）。
+    # 170 留约 85 分钟余量，够 8443 或 AWS 扩容后的增长。
     timeout-minutes: 170
     permissions:
       contents: read
@@ -77,29 +76,47 @@ jobs:
           # old_count=0、保护不触发，用只含本轮结果的版本覆盖历史累积。
           cp result_repo/AWS.txt ./ 2>/dev/null || true
 
-      # 按 region 取段而非按 ASN：AS16509 全球 1.75 亿 IPv4，三个地区只占
-      # 一小部分，按 ASN 扫等于把欧美段也一起扫了。AWS 官方 ip-ranges.json
-      # 带 region 字段，归属比 BGP 前缀准（是 AWS 自己标的）。
+      # 按 region 取段而非按 ASN：AS16509 全球 1.75 亿 IPv4，按 ASN 扫等于
+      # 把欧美段也一起扫了。AWS 官方 ip-ranges.json 带 region 字段，归属比
+      # BGP 前缀准（是 AWS 自己标的）。实测四个 region 的 EC2 段只有 808 万，
+      # 比按 ASN 少一个数量级。
       # 只取 service=EC2：AMAZON 是含 S3/API Gateway 等托管服务的超集，
       # CLOUDFRONT 是 CDN 边缘，都不是 proxyip 后端。
       #
-      # MAX_IPS 兜住 AWS 扩容：段数悄悄涨了也不会静默超时间预算，日志会告警。
-      # 19,000,000 的来历 —— 闸门 140 分钟里 masscan 只拿 70% = 98 分钟：
-      #   98 × 60 × 10000pps / (1 + 2 retries) / 1 端口 ≈ 1960 万 IP
+      # 首轮实测分布（225 → 176 段合并后）：
+      #   ap-northeast-1 东京   69 段  4,299,296 IP  53.2%
+      #   ap-southeast-1 新加坡 75 段  2,597,920 IP  32.1%
+      #   ap-east-1      香港   27 段    784,144 IP   9.7%
+      #   ap-northeast-3 大阪   22 段    403,984 IP   5.0%
+      #
+      # MAX_IPS 兜住 AWS 扩容：段数悄悄涨了也不会静默超时间预算。
+      # 12,000,000 的来历 —— 按首轮实测比例（每 100 万 IP 对应 13.3 万开放
+      # 目标、约 2.5 分钟 TLS）：masscan 63 分钟 + TLS 40 分钟 = 103 分钟，
+      # 在 140 闸门内安全。设 19M 会到 163 分钟，超。
       - name: Build AWS target list
         env:
           AWS_REGIONS: 'ap-east-1,ap-northeast-1,ap-northeast-3,ap-southeast-1'
           AWS_SERVICE: 'EC2'
           OUT_FILE: 'aws_targets.txt'
-          MAX_IPS: ${{ inputs.max_ips || '19000000' }}
+          MAX_IPS: ${{ inputs.max_ips || '12000000' }}
         run: python build_aws_targets.py
 
       # 一轮扫完，不做断点续扫，所以没有 state、没有 cadence、没有 finalize。
       # 被闸门截断也不要紧：masscan 内部会打乱目标顺序，每轮覆盖的是随机
-      # 子集，长期看等价于全覆盖，对超大低密度目标比顺序续扫更快见到产出。
+      # 子集，长期看等价于全覆盖。
       #
-      # 单端口 443 而非 443,8443：同样的时间预算宁可多扫 IP。port-stats
-      # 的口径里默认端口产出比非默认高一个数量级，443 是默认端口里的主力。
+      # rate 10000 不要降：首轮实际速率稳定在 9.8-9.99kpps 全程无掉速，
+      # 说明没被限速；开放率 13.29% 也不像有大量 SYN 被丢。降到 5000 会让
+      # masscan 从 42.8 涨到 85.6 分钟，挤掉 TLS 的预算反而导致一阶段截断。
+      #
+      # TLS_CONC 500（默认 300）：一阶段要处理 107 万个开放目标，是耗时
+      # 最大的一段。首轮 300 并发用了约 34 分钟，平均 19ms/目标 —— 绝大多数
+      # 被立刻 RST，没吃满 3 秒超时，所以并发提上去边际收益明显。
+      # fd 上限已调到 65536，500 并发绰绰有余。
+      #
+      # 单端口 443 而非 443,8443：8443 的响应特征未知（可能更多连接超时
+      # 而非 RST，那 TLS 阶段会慢得多），等这轮看到 500 并发的时间弹性
+      # 再评估。port-stats 的口径里 443 是默认端口里的主力。
       - name: Run Scan
         id: scan
         env:
@@ -110,6 +127,7 @@ jobs:
           MASSCAN_RATE: ${{ inputs.rate || '10000' }}
           MASSCAN_RETRIES: "2"
           MASSCAN_WAIT: "5"
+          TLS_CONC: "500"
         run: |
           echo "[INFO] segs=${AWS_TARGET_SEGS} ips=${AWS_TARGET_IPS}"
           python check_cf_asn_masscan_dmit.py \
