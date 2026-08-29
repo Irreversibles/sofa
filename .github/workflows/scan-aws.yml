@@ -1,0 +1,168 @@
+name: Scan AWS (HK/JP/SG)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ports:
+        description: '端口，逗号分隔'
+        required: false
+        default: '443,8443'
+      rate:
+        description: 'masscan pps。AWS 是云厂商，5000-10000 安全'
+        required: false
+        default: '10000'
+  schedule:
+    # UTC 04:00 —— 原 Google 的档期，停扫后空出来。
+    # 本线不碰 dmit_ports_state.json（无端口轮转），不受那个 8 小时等距
+    # 窗口约束；与 DMIT(02:20 起最坏到 08:10) 只是 .txt push 竞争，
+    # 文件不同，重试逻辑能处理。
+    - cron: '0 4 * * *'
+
+concurrency:
+  group: scan-aws
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y masscan
+
+      - name: Pull old result
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          # write_result_file 靠本地已有文件触发防覆盖保护，缺文件会导致
+          # old_count=0、保护不触发，用只含本轮结果的版本覆盖历史累积。
+          cp result_repo/AWS.txt ./ 2>/dev/null || true
+
+      # 按 region 取段而非按 ASN：AS16509 全球 1.75 亿，三个地区只占一小部分。
+      # MAX_IPS 兜住 AWS 扩容 —— 段数涨了也不会一声不响地超时间预算。
+      - name: Build AWS target list
+        env:
+          AWS_REGIONS: 'ap-east-1,ap-northeast-1,ap-northeast-3,ap-southeast-1'
+          AWS_SERVICE: 'EC2'
+          OUT_FILE: 'aws_targets.txt'
+          MAX_IPS: '40000000'
+        run: python build_aws_targets.py
+
+      # 一轮扫完，不做断点续扫，所以没有 state、没有 cadence、没有 finalize。
+      # masscan 耗时 ≈ IP数 × 端口数 × (1+retries) / rate / 60
+      - name: Run Scan
+        id: scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          CHECK_API: ${{ secrets.CHECK_API }}
+          MASK_PORT_LOG: "1"
+          SCAN_DEADLINE_MIN: "300"
+          MASSCAN_RATE: ${{ inputs.rate || '10000' }}
+          MASSCAN_RETRIES: "2"
+          MASSCAN_WAIT: "5"
+        run: |
+          echo "[INFO] segs=${AWS_TARGET_SEGS} ips=${AWS_TARGET_IPS}"
+          python check_cf_asn_masscan_dmit.py \
+            "aws_targets.txt" "AWS" "${{ inputs.ports || '443,8443' }}"
+
+      - name: Push result
+        if: steps.scan.outcome == 'success'
+        run: |
+          if [ ! -s scan_out_files.txt ]; then
+            echo "本轮无产出文件，跳过推送"
+            exit 0
+          fi
+
+          while read -r f; do
+            [ -z "$f" ] && continue
+            [ -s "$f" ] || continue
+            cp "$f" result_repo/
+          done < scan_out_files.txt
+
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          while read -r f; do
+            [ -z "$f" ] && continue
+            git add "$f" 2>/dev/null || true
+          done < ../scan_out_files.txt
+
+          if git diff --staged --quiet; then
+            echo "no change"
+            exit 0
+          fi
+
+          git commit -m "auto: update AWS (HK/JP/SG)"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              # .txt 是行集合、顺序无关，sort -u 取并集安全
+              CONFLICTS=$(git diff --name-only --diff-filter=U)
+              ABORT=0
+              if [ -n "$CONFLICTS" ]; then
+                for f in $CONFLICTS; do
+                  case "$f" in
+                    *.txt)  sort -u "$f" -o "$f"; git add "$f" ;;
+                    *.json) git checkout --theirs "$f" || true; git add "$f" ;;
+                    *)      ABORT=1; break ;;
+                  esac
+                done
+              fi
+              if [ "$ABORT" = "1" ]; then
+                git rebase --abort 2>/dev/null || true
+              elif [ -n "$CONFLICTS" ]; then
+                GIT_EDITOR=true git rebase --continue || git rebase --abort
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f aws_targets.txt
+          rm -f scan_done_ports.txt scan_metrics.json scan_truncated.txt
+          rm -f scan_out_files.txt
+          rm -rf .tmp
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          TRUNC=$(cat scan_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全"
+
+          if [ "${{ job.status }}" != "success" ]; then
+            MSG="❌ 扫描失败%0A服务商: AWS (HK/JP/SG)%0A状态: ${{ job.status }}"
+          else
+            MSG="✅ 扫描完成%0A服务商: AWS (HK/JP/SG)%0A目标: ${AWS_TARGET_IPS:-?} IP / ${AWS_TARGET_SEGS:-?} 段%0A本次新增: ${COUNT} 个${WARN}"
+          fi
+
+          RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}")
+
+          case "$RESP" in
+            *'"ok":true'*) : ;;
+            *) echo "::error::TG 推送失败" ;;
+          esac
