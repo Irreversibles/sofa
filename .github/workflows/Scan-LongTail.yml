@@ -69,7 +69,7 @@ jobs:
       - name: Build port list + cadence decision
         env:
           STATE_FILE: "dmit_ports_state.json"
-          ASN: "61112,212336,139659,63473,149440,6134,932,967,400464,63150,1054,38136,26383,138997"
+          ASN: "61112,212336,139659,63473,149440,6134,932,967,400464,63150,1054,38136,26383,138997,140096"
           DEFAULT_PORTS: "443,8443,2053,2083,2096"
           SCAN_BUDGET_MIN: "170"
           # 5000pps 实测吞吐（DMIT 线：4,474,880 目标 / 51.1 分钟）
@@ -107,7 +107,7 @@ jobs:
             61112=Akile,212336=ByteVirt,139659=LUCIDACLOUD,
             63473=HostHatch,149440=Evoxt,6134=XNNET,932=XNNET,
             967=VMISS,400464=VMISS,63150=BAGECLOUD,1054=Zont,
-            38136=Akari,26383=Baxet,138997=Eons
+            38136=Akari,26383=Baxet,138997=Eons,140096=Jinx
         run: |
           echo "[INFO] scan_target=${SCAN_TARGET} port_count=${MERGED_PORTS_COUNT} est=${EST_MINUTES}min"
           python check_cf_asn_masscan_dmit.py "${SCAN_TARGET}" "LongTail" "${MERGED_PORTS}"
