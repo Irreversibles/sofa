@@ -6,3 +6,4 @@ __pycache__/
 dmit_ports_pool.txt
 dmit_ports_state.json
 SCHEDULE.md
+aws_targets.txt
