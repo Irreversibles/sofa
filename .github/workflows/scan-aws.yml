@@ -4,19 +4,40 @@ on:
   workflow_dispatch:
     inputs:
       ports:
-        description: '端口，逗号分隔'
+        description: '端口，逗号分隔。单端口能多扫一倍 IP，建议就用 443'
         required: false
-        default: '443,8443'
+        default: '443'
       rate:
         description: 'masscan pps。AWS 是云厂商，5000-10000 安全'
         required: false
         default: '10000'
+      max_ips:
+        description: '目标 IP 上限，超出按段顺序截断。0=不限'
+        required: false
+        default: '19000000'
   schedule:
-    # UTC 04:00 —— 原 Google 的档期，停扫后空出来。
-    # 本线不碰 dmit_ports_state.json（无端口轮转），不受那个 8 小时等距
-    # 窗口约束；与 DMIT(02:20 起最坏到 08:10) 只是 .txt push 竞争，
-    # 文件不同，重试逻辑能处理。
-    - cron: '0 4 * * *'
+    # 周二/周五 08:37 UTC（北京 16:37）。
+    #
+    # 选这个时段的理由：
+    #   前面 Recheck(06:17 起，闸门 100 分钟) 最坏 08:00 收工 —— 错开它是
+    #     硬要求。两边都要打 CHECK_API，撞上会把 Worker 配额吃光，导致
+    #     recheck 侧 API 异常占比破 30%（API_ERROR_ABORT_RATIO），整轮复验
+    #     被静默跳过，而 TG 通知仍显示"完成"，只有日志里看得出来。
+    #   DMIT(02:20 起) 3 天一次，实际约 2 小时结束，闸门最坏 08:10。
+    #   后面 LongTail 11:00 起，前 10 分钟在装依赖/clone/选端口，不打 API。
+    #   周二/周五避开 Tencent（周一四 10:00）。
+    #
+    # 本线不写任何 state（无端口轮转、无 cadence、无 finalize），不参与
+    # dmit_ports_state.json 的 JSON 冲突，所以不受 DMIT/LongTail/xTom
+    # 那个 8 小时等距窗口的约束，只需避开 CHECK_API 竞争。
+    #
+    # 频率 2 天一次而非每天：AWS 产出密度未知（不像长尾线有 TG 消息条数、
+    # Quality 线有 BGP 邻居关系作依据），先低频量几轮产出比再决定是否提频；
+    # 且 AWS abuse 团队比小商家积极，投诉发给流量来源方（GitHub），
+    # 低频直接降低暴露面。
+    #
+    # 分钟取 37 而非 0：整点是 GitHub 定时队列最拥挤的时刻，被丢弃概率高。
+    - cron: '37 8 * * 2,5'
 
 concurrency:
   group: scan-aws
@@ -25,7 +46,9 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    # 170 而非 350：本线要塞进 Recheck 收工(08:00) 到 LongTail 进 masscan
+    # 之间的空档。脚本内闸门 140 分钟，余下 30 分钟给装依赖、clone、push 重试。
+    timeout-minutes: 170
     permissions:
       contents: read
 
@@ -54,33 +77,48 @@ jobs:
           # old_count=0、保护不触发，用只含本轮结果的版本覆盖历史累积。
           cp result_repo/AWS.txt ./ 2>/dev/null || true
 
-      # 按 region 取段而非按 ASN：AS16509 全球 1.75 亿，三个地区只占一小部分。
-      # MAX_IPS 兜住 AWS 扩容 —— 段数涨了也不会一声不响地超时间预算。
+      # 按 region 取段而非按 ASN：AS16509 全球 1.75 亿 IPv4，三个地区只占
+      # 一小部分，按 ASN 扫等于把欧美段也一起扫了。AWS 官方 ip-ranges.json
+      # 带 region 字段，归属比 BGP 前缀准（是 AWS 自己标的）。
+      # 只取 service=EC2：AMAZON 是含 S3/API Gateway 等托管服务的超集，
+      # CLOUDFRONT 是 CDN 边缘，都不是 proxyip 后端。
+      #
+      # MAX_IPS 兜住 AWS 扩容：段数悄悄涨了也不会静默超时间预算，日志会告警。
+      # 19,000,000 的来历 —— 闸门 140 分钟里 masscan 只拿 70% = 98 分钟：
+      #   98 × 60 × 10000pps / (1 + 2 retries) / 1 端口 ≈ 1960 万 IP
       - name: Build AWS target list
         env:
           AWS_REGIONS: 'ap-east-1,ap-northeast-1,ap-northeast-3,ap-southeast-1'
           AWS_SERVICE: 'EC2'
           OUT_FILE: 'aws_targets.txt'
-          MAX_IPS: '40000000'
+          MAX_IPS: ${{ inputs.max_ips || '19000000' }}
         run: python build_aws_targets.py
 
       # 一轮扫完，不做断点续扫，所以没有 state、没有 cadence、没有 finalize。
-      # masscan 耗时 ≈ IP数 × 端口数 × (1+retries) / rate / 60
+      # 被闸门截断也不要紧：masscan 内部会打乱目标顺序，每轮覆盖的是随机
+      # 子集，长期看等价于全覆盖，对超大低密度目标比顺序续扫更快见到产出。
+      #
+      # 单端口 443 而非 443,8443：同样的时间预算宁可多扫 IP。port-stats
+      # 的口径里默认端口产出比非默认高一个数量级，443 是默认端口里的主力。
       - name: Run Scan
         id: scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
           CHECK_API: ${{ secrets.CHECK_API }}
           MASK_PORT_LOG: "1"
-          SCAN_DEADLINE_MIN: "300"
+          SCAN_DEADLINE_MIN: "140"
           MASSCAN_RATE: ${{ inputs.rate || '10000' }}
           MASSCAN_RETRIES: "2"
           MASSCAN_WAIT: "5"
         run: |
           echo "[INFO] segs=${AWS_TARGET_SEGS} ips=${AWS_TARGET_IPS}"
           python check_cf_asn_masscan_dmit.py \
-            "aws_targets.txt" "AWS" "${{ inputs.ports || '443,8443' }}"
+            "aws_targets.txt" "AWS" "${{ inputs.ports || '443' }}"
 
+      # 落地国家由 CHECK_API 写进 #country，HK/JP/SG 自然区分开，所以输出
+      # 走单文件 AWS.txt、标签不带地区（同 xTom 线的思路）。
+      # 分文件模式（ASN_NAMES）对文件输入无效：CIDR 走 plain_nets，
+      # 建不起 IP→ASN 反查表。
       - name: Push result
         if: steps.scan.outcome == 'success'
         run: |
@@ -113,7 +151,8 @@ jobs:
             git push && break
             echo "push 冲突，第 $i 次重试..."
             if ! git pull --rebase origin main; then
-              # .txt 是行集合、顺序无关，sort -u 取并集安全
+              # .txt 结果文件是行集合、顺序无关，sort -u 取并集安全
+              #（冲突通常来自 recheck 同时在刷 country / 剔除失效条目）
               CONFLICTS=$(git diff --name-only --diff-filter=U)
               ABORT=0
               if [ -n "$CONFLICTS" ]; then
@@ -150,12 +189,12 @@ jobs:
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
           TRUNC=$(cat scan_truncated.txt 2>/dev/null || echo "0")
           WARN=""
-          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全"
+          [ "$TRUNC" = "1" ] && WARN="%0A⚠️ 本轮触及时间闸门，未扫全（下轮随机覆盖其他段）"
 
           if [ "${{ job.status }}" != "success" ]; then
             MSG="❌ 扫描失败%0A服务商: AWS (HK/JP/SG)%0A状态: ${{ job.status }}"
           else
-            MSG="✅ 扫描完成%0A服务商: AWS (HK/JP/SG)%0A目标: ${AWS_TARGET_IPS:-?} IP / ${AWS_TARGET_SEGS:-?} 段%0A本次新增: ${COUNT} 个${WARN}"
+            MSG="✅ 扫描完成%0A服务商: AWS (HK/JP/SG)%0A目标: ${AWS_TARGET_IPS:-?} IP / ${AWS_TARGET_SEGS:-?} 段%0A端口: ${{ inputs.ports || '443' }}%0Arate: ${{ inputs.rate || '10000' }}pps%0A本次新增: ${COUNT} 个${WARN}"
           fi
 
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
