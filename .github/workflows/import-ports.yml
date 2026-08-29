@@ -1,0 +1,108 @@
+name: Import ports from CSV
+
+# 手动一次性工具：把私库里的 CSV 端口导入 dmit_ports_state.json 的某个桶。
+# 放在 Actions 里而不是本地跑，是为了 clone→改→push 一分钟内完成 ——
+# 手动下载再上传的话，中间十几分钟里若有扫描线推了新 state（那里记着
+# last_scanned 轮转进度），就会被旧副本覆盖回去。
+# 回滚：私库那条 commit 点 Revert。
+on:
+  workflow_dispatch:
+    inputs:
+      csv:
+        description: '私库里的 CSV 文件名（先用网页 Upload files 传上去）'
+        required: true
+        default: 'ports.csv'
+      asn:
+        description: '写入哪个桶（纯数字）'
+        required: true
+        default: '906'
+      require:
+        description: '行过滤 "列名:文本"，留空则全部行。CSV 里混着 Cloudflare, Inc. 的行时用它剔掉'
+        required: false
+        default: 'ASN组织:DMIT'
+      port_col:
+        description: '端口列号（从1开始），0=自动识别表头'
+        required: false
+        default: '0'
+      new_as_rescan:
+        description: '新端口放进复扫队列（不阻塞原有覆盖进度）'
+        type: boolean
+        required: false
+        default: false
+      apply:
+        description: '真正写入并推送（不勾选=只看统计）'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: port-state-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Pull private repo
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          test -f "result_repo/dmit_ports_state.json" || { echo "私库里没有 state 文件"; exit 1; }
+          test -f "result_repo/${{ inputs.csv }}" || { echo "私库里没有 ${{ inputs.csv }}，先用网页 Upload files 传上去"; exit 1; }
+          cp result_repo/dmit_ports_state.json ./
+
+      - name: Import
+        env:
+          STATE_FILE: 'dmit_ports_state.json'
+          CSV_FILE: 'result_repo/${{ inputs.csv }}'
+          ASN: ${{ inputs.asn }}
+          REQUIRE: ${{ inputs.require }}
+          PORT_COL: ${{ inputs.port_col }}
+          NEW_AS_RESCAN: ${{ inputs.new_as_rescan && '1' || '0' }}
+          APPLY: ${{ inputs.apply && '1' || '0' }}
+          # DMIT 线 PORTS_MAX_TOTAL 扣掉默认 5 个端口后每轮实际轮转数，
+          # 仅用于估算"约几轮覆盖一遍"
+          ROTATE_QUOTA: '3'
+        run: python import_ports.py
+
+      - name: Push state
+        if: ${{ inputs.apply }}
+        run: |
+          cp dmit_ports_state.json result_repo/
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add dmit_ports_state.json
+          if git diff --staged --quiet; then
+            echo "state 无变化"
+            exit 0
+          fi
+          git commit -m "import: AS${{ inputs.asn }} 端口档案（来自 ${{ inputs.csv }}）"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push 冲突，第 $i 次重试..."
+            if ! git pull --rebase origin main; then
+              # rebase 中 --theirs 指正在应用的提交，即本次导入的版本。
+              # 极端情况下会丢掉冲突方对 state 的改动（某条扫描线刚标记的
+              # last_scanned），代价是那批端口下轮被重选、白扫一次，不丢数据。
+              git checkout --theirs dmit_ports_state.json || true
+              git add dmit_ports_state.json
+              GIT_EDITOR=true git rebase --continue || git rebase --abort
+            fi
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "新增端口: ${IMPORT_ADDED:-未写入}"
+          echo "count+1:  ${IMPORT_BUMPED:-未写入}"
