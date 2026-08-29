@@ -17,15 +17,23 @@ on:
         required: true
         default: '906'
       require:
-        description: '行过滤 "列名:文本"，留空则全部行。CSV 里混着 Cloudflare, Inc. 的行时用它剔掉'
+        # default 必须留空。GitHub 对带 default 的 input 在提交空值时会回落到
+        # 默认值 —— 之前 default 写成 'ASN组织:DMIT'，在输入框里清空也没用，
+        # 每次都照旧过滤。而这份 CSV 的 ASN组织 列本身不可靠：DMIT 自己的
+        # IP 也被标成 Cloudflare, Inc.，拿它过滤会误剔。
+        description: '行过滤 "列名:文本"，一般留空。注意 ASN组织 列不可靠（DMIT 的 IP 也会被标成 Cloudflare, Inc.）'
         required: false
-        default: 'ASN组织:DMIT'
+        default: ''
       port_col:
         description: '端口列号（从1开始），0=自动识别表头'
         required: false
         default: '0'
       new_as_rescan:
-        description: '新端口放进复扫队列（不阻塞原有覆盖进度）'
+        # 勾选依据看 dry-run 打印的"约 N 轮覆盖一遍"：build 是严格覆盖优先，
+        # 池里只要还有 last_scanned==0 的端口就绝不复扫。N 超过 30 就该勾上，
+        # 让新端口进 scanned 池 —— 它们时间戳最小、仍排在所有旧端口之前优先扫，
+        # 但不会把 unscanned 队列堵住几十轮。
+        description: '新端口放进复扫队列（不阻塞原有覆盖进度）。dry-run 显示轮数 >30 时勾选'
         type: boolean
         required: false
         default: false
