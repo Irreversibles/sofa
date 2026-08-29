@@ -11,7 +11,9 @@ masscan 探活 + asyncio 三阶段 TLS + API 确认。
 不设 SCAN_DEADLINE_MIN 时闸门关闭，可当普通 masscan 脚本用。
 
 目标/名字/端口全由 argv 传入，实现是通用的（文件名带 dmit 只是历史原因），
-DMIT / xTom / 长尾等多条线共用本脚本。第一个参数支持逗号分隔多 ASN 或 CIDR。
+DMIT / xTom / 长尾等多条线共用本脚本。第一个参数支持逗号分隔多 ASN、CIDR，
+或一个 .txt 文件名（每行一个 CIDR，用于 AWS 这类按 region 过滤后段数达
+数百、塞不进 argv 的场景）。
 
 单文件 vs 分文件输出：
   不设 ASN_NAMES → 全部结果写 {argv[2]}.txt，标签统一。DMIT、xTom 用这个，
@@ -21,6 +23,7 @@ DMIT / xTom / 长尾等多条线共用本脚本。第一个参数支持逗号分
       格式 ASN_NAMES="61112=AkileCloud,967=VMISS,400464=VMISS"，
       多个 ASN 可映射到同一名字（同服务商的多个 ASN 合并成一个文件）；
       未列出的 ASN 兜底用 AS{num}.txt。
+      注意：从 .txt 读入的段没有 ASN 归属，分文件模式对纯文件输入无效。
 
 日志不输出任何 IP：本仓库公开，Actions 日志虽不进代码搜索索引但登录可见。
 结果只写入文件、推送私库。
@@ -221,6 +224,31 @@ def build_targets_file(target_input):
     for item in re.split(r'[\s,]+', str(target_input).strip()):
         if not item:
             continue
+
+        # 支持传 .txt：AWS 按 region 过滤后段数达数百，塞进 argv 不现实。
+        # 文件里的段没有 ASN 归属，走 plain_nets —— 单文件输出模式够用，
+        # 但 ASN_NAMES 分文件模式对纯文件输入无效（lookup 建不起来）。
+        if item.lower().endswith(".txt") and os.path.exists(item):
+            n_before = len(plain_nets)
+            try:
+                with open(item, encoding="utf-8") as fh:
+                    for ln in fh:
+                        ln = ln.split("#", 1)[0].strip()
+                        if not ln:
+                            continue
+                        try:
+                            n = ipaddress.ip_network(ln, strict=False)
+                        except ValueError:
+                            continue
+                        if n.version == 4:
+                            plain_nets.append(n)
+            except Exception as e:
+                print(f"[-] 读取 {item} 失败: {type(e).__name__}: {e}", flush=True)
+                continue
+            print(f"[*] 从 {item} 读入 {len(plain_nets) - n_before} 个段",
+                  flush=True)
+            continue
+
         try:
             net = ipaddress.ip_network(item, strict=False)
             if net.version == 4:
