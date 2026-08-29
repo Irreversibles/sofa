@@ -23,7 +23,7 @@ on:
     #     硬要求。两边都要打 CHECK_API，撞上会把 Worker 配额吃光，导致
     #     recheck 侧 API 异常占比破 30%（API_ERROR_ABORT_RATIO），整轮复验
     #     被静默跳过，而 TG 通知仍显示"完成"，只有日志里看得出来。
-    #   DMIT(02:20 起) 3 天一次，闸门最坏 08:10。
+    #   DMIT(02:20 起) 闸门最坏 08:10。
     #   后面 LongTail 11:00 起，前 10 分钟在装依赖/clone/选端口，不打 API。
     #   周二/周五避开 Tencent（周一四 10:00）。
     #
@@ -31,9 +31,8 @@ on:
     # dmit_ports_state.json 的 JSON 冲突，所以不受 DMIT/LongTail/xTom
     # 那个 8 小时等距窗口的约束，只需避开 CHECK_API 竞争。
     #
-    # 频率 2 天一次而非每天：首轮 930 条全算新增只因 AWS.txt 原本不存在，
-    # 真实增量要等第二轮才看得出。且 AWS abuse 团队比小商家积极，投诉发给
-    # 流量来源方（GitHub），低频直接降低暴露面。
+    # 频率 2 天一次而非每天：AWS abuse 团队比小商家积极，投诉发给流量
+    # 来源方（GitHub），低频直接降低暴露面。
     #
     # 分钟取 37 而非 0：整点是 GitHub 定时队列最拥挤的时刻，被丢弃概率高。
     - cron: '37 8 * * 2,5'
@@ -42,6 +41,27 @@ concurrency:
   group: scan-aws
   cancel-in-progress: false
 
+# ⚠️ 本线产出是【候选集】，不能直接当入口 IP 用。
+#
+# 2026-08-29 首轮 930 条，下载到本地用 filter_seg.py 从国内实测：
+#     timeout 719 (77.3%)  国内直连不通
+#     ok      191 (20.5%)  可用
+#     cert     17 ( 1.8%)  CF Origin CA 源站，假阳性
+# 原因是本流程全程美国视角（masscan、TLS 三阶段、CHECK_API、Recheck 都
+# 从 runner 发起），而入口 IP 要求的是「国内客户端 → 该 IP」这个方向可达。
+# CHECK_API 验的是「Worker colo → 该地址」（ProxyIP 用途），两个方向不同。
+# 实测 13.113.187.222 在 Actions 里全程通过，从国内 TCP 就超时。
+#
+# 所以每轮扫完必须本地跑一次筛选，用 AWS.entry.txt 而不是 AWS.txt：
+#     python filter_seg.py AWS.txt
+# EC2 弹性 IP 释放后几小时就重新分配，筛选结果有保质期，隔几天要重跑。
+#
+# region 差异（首轮实测，可用率 / 延迟中位）：
+#     ap-southeast-1 新加坡  16.5%  最快   259.8 万 IP
+#     ap-northeast-1 东京    22.6%  中     429.9 万 IP
+#     ap-east-1      香港    57.1%  最慢    78.4 万 IP（样本仅 21 条）
+# 香港命中率最高但延迟最差，新加坡反之。三个都留着 —— 整轮 84 分钟、
+# 闸门 140，时间不紧张，没必要为省时间牺牲绝对产出。
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -116,7 +136,7 @@ jobs:
       #
       # 单端口 443 而非 443,8443：8443 的响应特征未知（可能更多连接超时
       # 而非 RST，那 TLS 阶段会慢得多），等这轮看到 500 并发的时间弹性
-      # 再评估。port-stats 的口径里 443 是默认端口里的主力。
+      # 再评估。
       - name: Run Scan
         id: scan
         env:
@@ -134,7 +154,9 @@ jobs:
             "aws_targets.txt" "AWS" "${{ inputs.ports || '443' }}"
 
       # 落地国家由 CHECK_API 写进 #country，HK/JP/SG 自然区分开，所以输出
-      # 走单文件 AWS.txt、标签不带地区（同 xTom 线的思路）。
+      # 走单文件 AWS.txt、标签不带地区。
+      # 注意 #country 对少数条目不准（实测 95.40.227.67 标 #US、
+      # 18.166.216.113 标 #JP，实际都是 ap-east-1 的段），别拿它 grep region。
       # 分文件模式（ASN_NAMES）对文件输入无效：CIDR 走 plain_nets，
       # 建不起 IP→ASN 反查表。
       - name: Push result
@@ -212,7 +234,7 @@ jobs:
           if [ "${{ job.status }}" != "success" ]; then
             MSG="❌ 扫描失败%0A服务商: AWS (HK/JP/SG)%0A状态: ${{ job.status }}"
           else
-            MSG="✅ 扫描完成%0A服务商: AWS (HK/JP/SG)%0A目标: ${AWS_TARGET_IPS:-?} IP / ${AWS_TARGET_SEGS:-?} 段%0A端口: ${{ inputs.ports || '443' }}%0Arate: ${{ inputs.rate || '10000' }}pps%0A本次新增: ${COUNT} 个${WARN}"
+            MSG="✅ 扫描完成%0A服务商: AWS (HK/JP/SG)%0A目标: ${AWS_TARGET_IPS:-?} IP / ${AWS_TARGET_SEGS:-?} 段%0A端口: ${{ inputs.ports || '443' }}%0Arate: ${{ inputs.rate || '10000' }}pps%0A本次新增: ${COUNT} 个%0A⚠️ 需本地 filter_seg.py 筛选后使用（约两成可用）${WARN}"
           fi
 
           RESP=$(curl -sS "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
