@@ -44,6 +44,9 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          # 同 Alibaba：实测单轮约 62 分钟（#23），双端口后约 125 分钟，
+          # 离 timeout-minutes 350 仍有余量，故 BUDGET_IPS 不下调。
+          PORTS: "443,8443"
           BUDGET_IPS: "3000000"
           CHECK_API: ${{ secrets.CHECK_API }}
         run: |
@@ -113,7 +116,7 @@ jobs:
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
           if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: Google%0AASN: 396982+19527%0A本次新增: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: Google%0AASN: 396982+19527%0A端口: 443,8443%0A本次新增: ${COUNT} 个"
           else
             MSG="❌ 扫描失败%0A服务商: Google%0A状态: ${{ job.status }}"
           fi
