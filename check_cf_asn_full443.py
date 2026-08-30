@@ -49,7 +49,33 @@ STATE_DIR = "state"
 ASN_FETCH_TIMEOUT = int(os.getenv("ASN_FETCH_TIMEOUT", "20"))
 META_TTL_SEC = int(os.getenv("META_TTL_SEC", str(7 * 86400)))  # 前缀元数据缓存7天
 
-# 阶段零：TCP 探活（全量443）
+
+# 端口：默认只 443，可传多个（如 PORTS="443,8443"）。
+#
+# 本引擎没有时间闸门 —— 不像 masscan 那条线到点就截断、结果照样入库，这里
+# 超时是 job 被 timeout-minutes 取消，_save_state 不执行，游标不推进，
+# 整轮完全白跑。所以加端口前必须确认单轮墙钟时间离预算还有余量。
+#
+# BUDGET_IPS 语义不变，仍是"每轮扫多少个 IP"，实际探测数 = BUDGET_IPS × 端口数，
+# 阶段零耗时大致等比拉长（实际在 1.5~2x 之间，取决于新端口上对端是回 RST
+# 还是静默丢包 —— 后者要走满 TCP_TIMEOUT）。
+#
+# 注意不要试图"按天交替端口"来省时间：本引擎游标是连续推进的，奇数日用 443
+# 扫 [0,2M)、偶数日用 8443 扫 [2M,4M)，没有任何 IP 会被两个端口都扫到。
+# 交替只在"每轮重扫全部段、只轮换端口"的 masscan 引擎里才有意义。
+def _parse_ports(s):
+    out = []
+    for x in (s or "").replace(" ", "").split(","):
+        if x.isdigit():
+            p = int(x)
+            if 1 <= p <= 65535 and p not in out:
+                out.append(p)
+    return out or [443]
+
+
+PORTS = _parse_ports(os.getenv("PORTS", "443"))
+
+# 阶段零：TCP 探活（全量）
 TCP_CONCURRENCY = int(os.getenv("TCP_CONCURRENCY", "2500"))
 TCP_TIMEOUT = float(os.getenv("TCP_TIMEOUT", "3.0"))
 BUDGET_IPS = int(os.getenv("BUDGET_IPS", "200000"))
@@ -259,6 +285,8 @@ def _load_or_build_meta(name_key, asn_list):
 
 
 def _load_or_init_state(name_key, asn_list, total_ips):
+    """游标按 IP 偏移记录，与端口数无关 —— 改 PORTS 不会触发重置、
+    不影响已有的覆盖进度。"""
     sfile = _state_file(name_key)
     asn_set = sorted(asn_list)
     if os.path.exists(sfile):
@@ -365,18 +393,18 @@ def _next_batch(meta, s, budget):
     return out, s, wrapped
 
 
-# ==================== TCP 443 探活 ====================
-async def tcp_open_443(ip, sem):
-    """纯 TCP 443 握手。成功返回 ip，失败返回 None"""
+# ==================== TCP 探活 ====================
+async def tcp_open(ip, port, sem):
+    """纯 TCP 握手。成功返回 (ip, port)，失败返回 None"""
     async with sem:
         writer = None
         try:
-            conn = asyncio.open_connection(ip, 443)
+            conn = asyncio.open_connection(ip, port)
             reader, writer = await asyncio.wait_for(conn, timeout=TCP_TIMEOUT)
             sock = writer.get_extra_info('socket')
             if sock:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            return ip
+            return (ip, port)
         except Exception:
             return None
         finally:
@@ -388,18 +416,23 @@ async def tcp_open_443(ip, sem):
                     pass
 
 
-async def scan_tcp_443(ips):
-    """分块并发扫描 443，返回开放 IP 列表"""
+async def scan_tcp(ips, ports):
+    """分块并发探活，返回开放的 (ip, port) 列表。
+
+    按 IP 分块、块内展开全部端口，使每批实际连接数仍约等于 TCP_BATCH ——
+    否则多端口时单批会翻倍，瞬时 fd 占用和内存跟着涨。
+    """
     sem = asyncio.Semaphore(TCP_CONCURRENCY)
     alive = []
-    total = len(ips)
+    total = len(ips) * len(ports)
     done = 0
-    for i in range(0, total, TCP_BATCH):
-        part = ips[i:i + TCP_BATCH]
-        res = await asyncio.gather(*[tcp_open_443(ip, sem) for ip in part])
+    step = max(1, TCP_BATCH // len(ports))
+    for i in range(0, len(ips), step):
+        part = [(ip, p) for ip in ips[i:i + step] for p in ports]
+        res = await asyncio.gather(*[tcp_open(ip, p, sem) for ip, p in part])
         alive.extend([x for x in res if x])
         done += len(part)
-        print(f"  [443探活] {done:,}/{total:,} | 开放: {len(alive):,}", flush=True)
+        print(f"  [TCP探活] {done:,}/{total:,} | 开放: {len(alive):,}", flush=True)
     return alive
 
 
@@ -591,8 +624,9 @@ async def main():
     print(f"[*] 引擎：uvloop={UVLOOP_ENABLED} | ASN组={asn_list} | "
           f"名字={name_label}", flush=True)
     print(f"[*] 参数：TCP并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s "
-          f"每轮预算={BUDGET_IPS:,}", flush=True)
-    print(f"[*] 端口固定：443（全量断点续扫）", flush=True)
+          f"每轮预算={BUDGET_IPS:,} IP", flush=True)
+    print(f"[*] 端口：{','.join(map(str, PORTS))}"
+          f"（{len(PORTS)} 个，全量断点续扫）", flush=True)
 
     meta, total_ips = _load_or_build_meta(name_key, asn_list)
     if not meta or total_ips <= 0:
@@ -625,24 +659,30 @@ async def main():
     # 打乱后同一时刻的并发落在分散地址上（不影响覆盖，游标已记录进度）
     random.shuffle(batch_ips)
 
-    print(f"[*] 本轮扫描 IP 数: {len(batch_ips):,}（仅端口 443，已打乱顺序）",
+    print(f"[*] 本轮 {len(batch_ips):,} IP × {len(PORTS)} 端口 = "
+          f"{len(batch_ips) * len(PORTS):,} 次探测（已打乱顺序）", flush=True)
+
+    # ==================== 阶段零：TCP 探活 ====================
+    alive = await scan_tcp(batch_ips, PORTS)
+    per_port = {}
+    for _, p in alive:
+        per_port[p] = per_port.get(p, 0) + 1
+    print(f"[+] 本轮 TCP 开放: {len(alive):,}"
+          f"（{' '.join(f'{p}:{per_port.get(p, 0):,}' for p in PORTS)}）",
           flush=True)
 
-    # ==================== 阶段零：TCP 443 探活 ====================
-    alive_ips = await scan_tcp_443(batch_ips)
-    print(f"[+] 本轮 TCP 开放 443: {len(alive_ips):,}", flush=True)
-
-    if not alive_ips:
+    if not alive:
         with open("count.txt", "w") as f:
             f.write("0")
-        print("[-] 无开放 443，跳过后续阶段，不覆盖已有结果。", flush=True)
+        print("[-] 无开放端口，跳过后续阶段，不覆盖已有结果。", flush=True)
         _save_state(name_key, s)
         return
 
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
 
     # ==================== 第一阶段：CF 证书 ====================
-    targets = [(ip, 443) for ip in alive_ips]
+    # 阶段零已返回 (ip, port)，后续三阶段本来就按 (ip, port) 遍历
+    targets = alive
     print(f"\n[1/4 第一阶段 TLS 探测] 校验 {len(targets):,} 个...", flush=True)
     r1 = await gather_staged(
         targets,
@@ -735,10 +775,12 @@ async def main():
     old_count = len(old_lines)
 
     new_count = 0
+    new_by_port = {}
     for ip, port, country in api_results:
         line = f"{ip}:{port}#{country} {name_label}"
         if line not in old_lines:
             new_count += 1
+            new_by_port[port] = new_by_port.get(port, 0) + 1
         old_lines.add(line)
 
     def sort_key(line):
@@ -771,6 +813,11 @@ async def main():
 
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
+    if len(PORTS) > 1:
+        # 分端口新增数：判断新加的端口到底有没有货，没货就该撤掉省时间
+        print(f"[*] 新增分端口: "
+              f"{' '.join(f'{p}:{new_by_port.get(p, 0)}' for p in PORTS)}",
+              flush=True)
     print(f"[+] 结果已保存（追加去重，详见私库）", flush=True)
 
 
