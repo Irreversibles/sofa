@@ -44,6 +44,12 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          # 端口从 1 个变 2 个 → 探测数翻倍 → 阶段零耗时约 1.5~2x。
+          # 本引擎没有时间闸门：超时是 job 被取消、游标不保存、整轮白跑，
+          # 所以加端口的前提是单轮墙钟时间离 timeout-minutes 有足够余量。
+          # 实测单轮约 47 分钟（#24），翻倍后约 95 分钟，离 350 很宽裕，
+          # 因此 BUDGET_IPS 不下调，IP 空间覆盖速度不受影响。
+          PORTS: "443,8443"
           BUDGET_IPS: "2000000"
           CHECK_API: ${{ secrets.CHECK_API }}
         run: |
@@ -113,7 +119,7 @@ jobs:
         run: |
           COUNT=$(cat count.txt 2>/dev/null || echo "?")
           if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ 扫描完成%0A服务商: Alibaba%0AASN: 45102+37963%0A本次新增: ${COUNT} 个"
+            MSG="✅ 扫描完成%0A服务商: Alibaba%0AASN: 45102+37963%0A端口: 443,8443%0A本次新增: ${COUNT} 个"
           else
             MSG="❌ 扫描失败%0A服务商: Alibaba%0A状态: ${{ job.status }}"
           fi
