@@ -1,0 +1,121 @@
+name: Recheck Manual (指定文件)
+
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: '要复验的文件,逗号分隔。填 ALL 表示全部,例: HKT.txt,Aiyun (HK).txt'
+        required: true
+        default: 'ALL'
+      deadline:
+        description: '时间闸门(分钟),默认100'
+        required: false
+        default: '100'
+
+concurrency:
+  group: recheck-manual
+  cancel-in-progress: false
+
+jobs:
+  recheck-manual:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+
+      - name: Pull results
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
+          shopt -s nullglob
+          for f in result_repo/*.txt; do
+            fn=$(basename "$f")
+            case "$fn" in requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;; esac
+            cp "$f" ./ 2>/dev/null || true
+          done
+          echo "[*] 私库文件数: $(ls -1 *.txt 2>/dev/null | wc -l)"
+
+      - name: Resolve target files
+        id: resolve
+        env:
+          INPUT_FILES: ${{ inputs.files }}
+        run: |
+          python - <<'PY'
+          import os, shlex, pathlib, sys
+          raw = os.environ.get("INPUT_FILES","").strip()
+          if raw.upper() == "ALL":
+              files = [str(p) for p in pathlib.Path(".").glob("*.txt") if p.name not in ["requirements.txt","ip.txt","count.txt","name.txt","recheck_summary.txt"]]
+          else:
+              files = []
+              for item in raw.split(","):
+                  f=item.strip()
+                  if not f: continue
+                  # 允许不带.txt
+                  if not f.lower().endswith(".txt"): f+=".txt"
+                  files.append(f)
+          # 过滤不存在的
+          ok=[]
+          for f in files:
+              if pathlib.Path(f).exists():
+                  ok.append(f)
+              else:
+                  print(f"[跳过] 不存在: {f}")
+          if not ok:
+              print("::error::没有可复验的文件")
+              sys.exit(1)
+          print(f"[*] 本次复验 {len(ok)} 个: {', '.join(ok)}")
+          # 写到环境文件供下一步使用
+          with open(os.environ["GITHUB_ENV"],"a",encoding="utf-8") as fh:
+              fh.write(f"TARGET_FILES={' '.join(shlex.quote(x) for x in ok)}\n")
+          PY
+
+      - name: Recheck specified files
+        env:
+          CHECK_API: ${{ secrets.CHECK_API }}
+          RECHECK_DEADLINE_MIN: ${{ inputs.deadline }}
+        run: |
+          echo "[*] 执行: python recheck_api.py $TARGET_FILES"
+          eval python recheck_api.py $TARGET_FILES
+          echo "--- recheck_summary.txt ---"
+          cat recheck_summary.txt 2>/dev/null || echo "(空)"
+          echo "--- recheck_truncated.txt ---"
+          cat recheck_truncated.txt 2>/dev/null || echo "0"
+
+      - name: Push back (only specified)
+        run: |
+          # 只推本次指定的文件，避免把其他文件的旧副本推回去
+          eval FILES=($TARGET_FILES)
+          for f in "${FILES[@]}"; do
+            [ -f "$f" ] && cp "$f" result_repo/ 2>/dev/null || true
+          done
+          cd result_repo
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          for f in "${FILES[@]}"; do
+            git add "$(basename "$f")" 2>/dev/null || true
+          done
+          if git diff --staged --quiet; then
+             echo "no change"
+             exit 0
+          fi
+          git commit -m "recheck manual: $(basename "${FILES[0]}") 等 ${#FILES[@]} 个"
+          for i in 1 2 3 4 5; do
+            git push && break
+            echo "push冲突 第 $i 次重试..."
+            git pull --rebase --autostash || exit 1
+            sleep $((RANDOM % 10 + 5))
+          done
+
+      - name: Notify TG
+        if: always()
+        run: |
+          if [ -s recheck_summary.txt ]; then cat recheck_summary.txt; fi
+          MSG="🔧 手动复验完成%0A文件: ${{ inputs.files }}%0A$(cat recheck_summary.txt 2>/dev/null | head -n 20)"
+          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" --data-urlencode "text=${MSG}" > /dev/null || true
