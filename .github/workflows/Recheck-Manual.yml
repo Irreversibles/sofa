@@ -8,16 +8,16 @@ on:
         required: true
         default: 'ALL'
       deadline:
-        description: '时间闸门(分钟) 必须小于 timeout 120'
+        description: '时间闸门(分钟) 必须 < 120'
         required: false
         default: '100'
       update_state:
-        description: '是否更新自动线的3天计时'
+        description: '是否更新自动线的3天计时(默认否)'
         type: boolean
         default: false
 
 concurrency:
-  group: recheck # 和自动共用一组，防止自动和手动同时跑抢私库
+  group: recheck-manual
   cancel-in-progress: false
 
 jobs:
@@ -42,40 +42,36 @@ jobs:
             case "$fn" in requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;; esac
             cp "$f" ./ 2>/dev/null || true
           done
-          echo "私库共 $(ls -1 *.txt 2>/dev/null | wc -l) 个结果文件"
-
-      - name: Resolve files
-        run: |
-          INPUT="${{ inputs.files }}"
-          FILES=()
-          if [ "$INPUT" = "ALL" ]; then
-            for f in *.txt; do
-              case "$f" in requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;; esac
-              FILES+=("$f")
-            done
-          else
-            IFS=',' read -ra ARR <<< "$INPUT"
-            for raw in "${ARR[@]}"; do
-              f=$(echo "$raw" | xargs) # 去空格
-              [[ "$f" != *.txt ]] && f="$f.txt"
-              if [ -f "$f" ]; then FILES+=("$f"); else echo "[跳过] 不存在: $f"; fi
-            done
-          fi
-          [ ${#FILES[@]} -eq 0 ] && { echo "::error::没有可复验文件"; exit 1; }
-          echo "本次复验 ${#FILES[@]} 个: ${FILES[*]}"
-          printf "%s\n" "${FILES[@]}" > /tmp/target.list
-          # 传给下一步
-          echo "TARGET_COUNT=${#FILES[@]}" >> $GITHUB_ENV
+          ls -lh *.txt | head -n 20
 
       - name: Recheck
         env:
           CHECK_API: ${{ secrets.CHECK_API }}
           RECHECK_DEADLINE_MIN: ${{ inputs.deadline }}
+          INPUT_FILES: ${{ inputs.files }}
         run: |
-          # 必须用数组传参，带空格的文件名才不会被拆开
-          mapfile -t FILES < /tmp/target.list
-          echo "复验 ${#FILES[@]} 个文件"
-          python recheck_api.py "${FILES[@]}"
+          python - <<'PY'
+          import os, pathlib, subprocess, shlex
+          raw = os.environ.get("INPUT_FILES","").strip()
+          if raw.upper() == "ALL":
+              files = [p.name for p in pathlib.Path(".").glob("*.txt") if p.name not in ["requirements.txt","ip.txt","count.txt","name.txt","recheck_summary.txt"]]
+          else:
+              files = []
+              for x in raw.split(","):
+                  f = x.strip()
+                  if not f: continue
+                  if not f.lower().endswith(".txt"): f += ".txt"
+                  if pathlib.Path(f).exists():
+                      files.append(f)
+                  else:
+                      print(f"[跳过] 不存在: {f}")
+          if not files:
+              raise SystemExit("没有可复验的文件，请检查输入文件名是否和私库一致")
+          print(f"[*] 本次复验 {len(files)} 个: {files}")
+          # 用subprocess避免shell拆空格
+          subprocess.run(["python", "recheck_api.py"] + files, check=True)
+          pathlib.Path("/tmp/target.list").write_text("\n".join(files), encoding="utf-8")
+          PY
           cat recheck_summary.txt 2>/dev/null || echo "无摘要"
           cat recheck_truncated.txt 2>/dev/null || echo "0"
 
@@ -83,7 +79,6 @@ jobs:
         if: ${{ inputs.update_state == true }}
         run: |
           python -c "import json,time;json.dump({'last_run_ts':time.time()},open('result_repo/recheck_state.json','w'))"
-          echo "已更新 recheck_state.json (手动影响自动节奏)"
 
       - name: Push back
         run: |
@@ -96,22 +91,13 @@ jobs:
           for f in "${FILES[@]}"; do git add "$(basename "$f")" 2>/dev/null || true; done
           git diff --staged --quiet && { echo "no change"; exit 0; }
           git commit -m "recheck manual: ${{ inputs.files }}"
-          for i in 1 2 3 4 5; do
-            git push && break
-            echo "push冲突 $i..."
-            git pull --rebase --autostash || exit 1
-            sleep $((RANDOM % 10 + 5))
-          done
+          for i in 1 2 3 4 5; do git push && break; echo "push冲突 $i..."; git pull --rebase --autostash || exit 1; sleep $((RANDOM % 10 + 5)); done
 
       - name: Notify TG
         if: always()
         run: |
           TRUNC=$(cat recheck_truncated.txt 2>/dev/null || echo 0)
           [ "$TRUNC" = "1" ] && WARN=$'\n⚠️ 触及时间闸门，剩余下轮继续' || WARN=""
-          if [ -s recheck_summary.txt ]; then
-            DETAILS=$(awk -F: '{rm+=$2;unk+=$3; if($2>0) printf " • %s：剔除 %s 个%s\n",$1,$2,($3>0?" (另 "$3" 条异常)":""); else if($3>0) printf " • %s：%s 条异常\n",$1,$3} END{printf "合计剔除 %d 个",rm; if(unk>0) printf "，%d 条异常",unk}' recheck_summary.txt)
-            MSG=$(printf '🔧 手动复验完成\n文件: %s\n%s%s' "${{ inputs.files }}" "$DETAILS" "$WARN")
-          else
-            MSG=$(printf '🔧 手动复验完成\n文件: %s\n无剔除%s' "${{ inputs.files }}" "$WARN")
-          fi
-          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" --data-urlencode "text=${MSG}" > /dev/null
+          DETAILS=$(awk -F: '{rm+=$2;unk+=$3} END{printf "合计剔除 %d 个，异常 %d",rm,unk}' recheck_summary.txt 2>/dev/null || echo "无")
+          MSG=$(printf '🔧 手动复验完成\n文件: %s\n%s%s' "${{ inputs.files }}" "$DETAILS" "$WARN")
+          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" --data-urlencode "text=${MSG}" > /dev/null || true
