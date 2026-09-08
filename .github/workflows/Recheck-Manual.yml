@@ -1,14 +1,14 @@
-name: Recheck Manual (指定文件)
+name: Recheck IP (手动指定)
 
 on:
   workflow_dispatch:
     inputs:
       files:
-        description: '要复验的文件,逗号分隔. 填 ALL=全部 例: HKT.txt,Aiyun (HK).txt'
+        description: '要复验的文件,逗号分隔。填 ALL 表示全部。例: HKT.txt,Aiyun (HK).txt'
         required: true
         default: 'ALL'
       deadline:
-        description: '时间闸门(分钟) 必须 < 120'
+        description: '时间闸门(分钟)，必须小于 120。默认 100'
         required: false
         default: '100'
       update_state:
@@ -21,83 +21,204 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  recheck-manual:
+  recheck:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: read
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
+        with:
+          python-version: '3.11'
       - run: pip install -r requirements.txt
 
       - name: Pull results
-        env: {TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}}
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
         run: |
           git clone https://x-access-token:${TOKEN}@github.com/Irreversibles/proxyip.git result_repo
           shopt -s nullglob
           for f in result_repo/*.txt; do
             fn=$(basename "$f")
-            case "$fn" in requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt) continue ;; esac
+            case "$fn" in
+              requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt|recheck_truncated.txt) continue ;;
+            esac
             cp "$f" ./ 2>/dev/null || true
           done
-          ls -lh *.txt | head -n 20
+          echo "本地结果文件数: $(ls -1 *.txt 2>/dev/null | wc -l)"
+
+      - name: Cadence gate
+        env:
+          # 手动触发强制执行
+          FORCE: '1'
+          MIN_HOURS: '66'
+        run: |
+          python - <<'PY'
+          import json, os, time
+          force = os.environ.get("FORCE") == "1"
+          min_h = float(os.environ.get("MIN_HOURS", "66"))
+          try:
+              with open("result_repo/recheck_state.json", encoding="utf-8") as f:
+                  last = float(json.load(f).get("last_run_ts", 0))
+          except Exception:
+              last = 0.0
+          elapsed = (time.time() - last) / 3600 if last else float("inf")
+          run = force or elapsed >= min_h
+          if last:
+              print(f"[*] 距上次复验 {elapsed:.1f} 小时（阈值 {min_h}）")
+          else:
+              print("[*] 无历史记录，首次运行")
+          print(f"[*] 本轮{'执行' if run else '跳过'}{'（手动强制）' if force and elapsed < min_h else ''}")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"SHOULD_RUN={'true' if run else 'false'}\n")
+              f.write(f"ELAPSED_H={elapsed if last else -1:.1f}\n")
+          PY
 
       - name: Recheck
+        if: env.SHOULD_RUN == 'true'
         env:
           CHECK_API: ${{ secrets.CHECK_API }}
           RECHECK_DEADLINE_MIN: ${{ inputs.deadline }}
-          INPUT_FILES: ${{ inputs.files }}
         run: |
-          python - <<'PY'
-          import os, pathlib, subprocess, shlex
-          raw = os.environ.get("INPUT_FILES","").strip()
-          if raw.upper() == "ALL":
-              files = [p.name for p in pathlib.Path(".").glob("*.txt") if p.name not in ["requirements.txt","ip.txt","count.txt","name.txt","recheck_summary.txt"]]
-          else:
-              files = []
-              for x in raw.split(","):
-                  f = x.strip()
-                  if not f: continue
-                  if not f.lower().endswith(".txt"): f += ".txt"
-                  if pathlib.Path(f).exists():
-                      files.append(f)
-                  else:
-                      print(f"[跳过] 不存在: {f}")
-          if not files:
-              raise SystemExit("没有可复验的文件，请检查输入文件名是否和私库一致")
-          print(f"[*] 本次复验 {len(files)} 个: {files}")
-          # 用subprocess避免shell拆空格
-          subprocess.run(["python", "recheck_api.py"] + files, check=True)
-          pathlib.Path("/tmp/target.list").write_text("\n".join(files), encoding="utf-8")
-          PY
-          cat recheck_summary.txt 2>/dev/null || echo "无摘要"
-          cat recheck_truncated.txt 2>/dev/null || echo "0"
+          # 手动指定文件，支持逗号分隔，支持带空格的文件名
+          INPUT_RAW="${{ inputs.files }}"
+          FILES=()
+
+          if [ "${INPUT_RAW}" = "ALL" ] || [ "${INPUT_RAW}" = "all" ]; then
+            # 原版逻辑：所有结果文件
+            shopt -s nullglob
+            for f in *.txt; do
+              case "$f" in
+                requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt|recheck_truncated.txt) continue ;;
+              esac
+              FILES+=("$f")
+            done
+          else
+            # 用逗号拆开，空格文件名不会被拆分
+            IFS=',' read -ra INPUT_ARR <<< "${INPUT_RAW}"
+            for raw in "${INPUT_ARR[@]}"; do
+              f=$(echo "$raw" | sed 's/^[ \t]*//;s/[ \t]*$//')
+              [ -z "$f" ] && continue
+              [[ "$f" != *.txt ]] && f="${f}.txt"
+              if [ -f "$f" ]; then
+                FILES+=("$f")
+              else
+                echo "[跳过] 不存在: $f"
+              fi
+            done
+          fi
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::error::没有可复验的文件"
+            exit 1
+          fi
+
+          echo "复验 ${#FILES[@]} 个文件"
+          python recheck_api.py "${FILES[@]}"
+
+          if [ -s recheck_summary.txt ]; then
+            echo "剔除摘要（文件:剔除数:API异常数）："
+            cat recheck_summary.txt
+          fi
 
       - name: Stamp cadence state
-        if: ${{ inputs.update_state == true }}
+        if: env.SHOULD_RUN == 'true' && success() && ${{ inputs.update_state == true }}
         run: |
           python -c "import json,time;json.dump({'last_run_ts':time.time()},open('result_repo/recheck_state.json','w'))"
 
       - name: Push back
+        if: env.SHOULD_RUN == 'true' && success()
         run: |
-          mapfile -t FILES < /tmp/target.list
-          for f in "${FILES[@]}"; do cp "$f" result_repo/ 2>/dev/null || true; done
+          # 只推本次复验的文件，避免把 clone 时拉到的其他旧副本推回去
+          INPUT_RAW="${{ inputs.files }}"
+
+          if [ "${INPUT_RAW}" = "ALL" ] || [ "${INPUT_RAW}" = "all" ]; then
+            shopt -s nullglob
+            for f in *.txt; do
+              case "$f" in
+                requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt|recheck_truncated.txt) continue ;;
+              esac
+              cp "$f" result_repo/ 2>/dev/null || true
+            done
+          else
+            IFS=',' read -ra INPUT_ARR <<< "${INPUT_RAW}"
+            for raw in "${INPUT_ARR[@]}"; do
+              f=$(echo "$raw" | sed 's/^[ \t]*//;s/[ \t]*$//')
+              [[ "$f" != *.txt ]] && f="${f}.txt"
+              [ -f "$f" ] && cp "$f" result_repo/ 2>/dev/null || true
+            done
+          fi
+
           cd result_repo
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add recheck_state.json 2>/dev/null || true
-          for f in "${FILES[@]}"; do git add "$(basename "$f")" 2>/dev/null || true; done
-          git diff --staged --quiet && { echo "no change"; exit 0; }
-          git commit -m "recheck manual: ${{ inputs.files }}"
-          for i in 1 2 3 4 5; do git push && break; echo "push冲突 $i..."; git pull --rebase --autostash || exit 1; sleep $((RANDOM % 10 + 5)); done
+
+          if [ -f recheck_state.json ]; then
+            git add recheck_state.json || true
+          fi
+
+          # 精确 add 结果文件
+          if [ "${INPUT_RAW}" = "ALL" ] || [ "${INPUT_RAW}" = "all" ]; then
+            shopt -s nullglob
+            for f in *.txt; do
+              case "$f" in
+                requirements.txt|ip.txt|count.txt|name.txt|recheck_summary.txt|recheck_truncated.txt) continue ;;
+              esac
+              git add "$f" || true
+            done
+          else
+            IFS=',' read -ra INPUT_ARR <<< "${INPUT_RAW}"
+            for raw in "${INPUT_ARR[@]}"; do
+              f=$(echo "$raw" | sed 's/^[ \t]*//;s/[ \t]*$//')
+              [[ "$f" != *.txt ]] && f="${f}.txt"
+              [ -f "$f" ] && git add "$f" || true
+            done
+          fi
+
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "recheck manual: ${{ inputs.files }}"
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push 冲突，第 $i 次重试..."
+              git pull --rebase --autostash || exit 1
+              sleep $((RANDOM % 10 + 5))
+            done
+          fi
 
       - name: Notify TG
         if: always()
         run: |
-          TRUNC=$(cat recheck_truncated.txt 2>/dev/null || echo 0)
-          [ "$TRUNC" = "1" ] && WARN=$'\n⚠️ 触及时间闸门，剩余下轮继续' || WARN=""
-          DETAILS=$(awk -F: '{rm+=$2;unk+=$3} END{printf "合计剔除 %d 个，异常 %d",rm,unk}' recheck_summary.txt 2>/dev/null || echo "无")
-          MSG=$(printf '🔧 手动复验完成\n文件: %s\n%s%s' "${{ inputs.files }}" "$DETAILS" "$WARN")
-          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" --data-urlencode "text=${MSG}" > /dev/null || true
+          TRUNC=$(cat recheck_truncated.txt 2>/dev/null || echo "0")
+          WARN=""
+          [ "$TRUNC" = "1" ] && WARN=$'\n⚠️ 触及时间闸门，剩余下轮继续'
+
+          if [ "${SHOULD_RUN:-true}" != "true" ]; then
+            MSG=$(printf '⏭️ 手动复验跳过\n距上次 %s 小时' "${ELAPSED_H}")
+          elif [ "${{ job.status }}" != "success" ]; then
+            MSG=$(printf '❌ 手动复验失败\n状态: %s' "${{ job.status }}")
+          elif [ -s recheck_summary.txt ]; then
+            DETAILS=$(awk -F: '
+              { rm += $2; unk += $3
+                if ($2 > 0)
+                  printf "  • %s：剔除 %s 个%s\n", $1, $2, \
+                         ($3 > 0 ? " (另 " $3 " 条API异常)" : "")
+                else if ($3 > 0)
+                  printf "  • %s：%s 条API异常待下轮\n", $1, $3
+              }
+              END {
+                printf "合计剔除 %d 个", rm
+                if (unk > 0) printf "，%d 条API异常待下轮", unk
+              }
+            ' recheck_summary.txt)
+            MSG=$(printf '🔧 手动复验完成\n文件: %s\n%s%s' "${{ inputs.files }}" "$DETAILS" "$WARN")
+          else
+            MSG=$(printf '🔧 手动复验完成\n文件: %s\n无失效IP需剔除%s' "${{ inputs.files }}" "$WARN")
+          fi
+          curl -sS -X POST \
+            "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" \
+            --data-urlencode "text=${MSG}"
